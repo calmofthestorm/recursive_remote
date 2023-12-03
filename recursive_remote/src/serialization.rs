@@ -194,9 +194,6 @@ impl std::fmt::Display for State {
     }
 }
 
-// pub namespaces: HashMap<String, NamespaceRef>,
-// pub parents: Vec<StateRef>,
-
 impl std::convert::TryFrom<&SerializedResourceKey> for ResourceKey {
     type Error = anyhow::Error;
 

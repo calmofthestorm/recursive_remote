@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -8,10 +9,13 @@ use log::{info, trace};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
+use crate::embedded_config::*;
 use crate::serialization::Ref;
 use crate::util::*;
 
-#[derive(Clone, Copy, EnumIter)]
+#[derive(
+    Copy, EnumIter, serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone, Hash,
+)]
 pub enum ConfigKey {
     Namespace,
     RemoteBranch,
@@ -19,6 +23,12 @@ pub enum ConfigKey {
     StateNaclKey,
     ShallowBasis,
     MaxObjectSize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
+pub enum ConfigValue {
+    String(String),
+    Int64(i64),
 }
 
 pub struct Args {
@@ -56,6 +66,51 @@ impl AsRef<str> for ConfigKey {
             ConfigKey::StateNaclKey => "recursive-state-nacl-key",
             ConfigKey::ShallowBasis => "recursive-shallow-basis",
             ConfigKey::MaxObjectSize => "recursive-max-object-size",
+        }
+    }
+}
+
+impl ConfigKey {
+    pub fn is_i64(&self) -> bool {
+        match self {
+            ConfigKey::Namespace => false,
+            ConfigKey::RemoteBranch => false,
+            ConfigKey::NamespaceNaclKey => false,
+            ConfigKey::StateNaclKey => false,
+            ConfigKey::ShallowBasis => false,
+            ConfigKey::MaxObjectSize => true,
+        }
+    }
+
+    pub fn as_short_str(&self) -> &'static str {
+        match self {
+            ConfigKey::Namespace => "a",
+            ConfigKey::RemoteBranch => "b",
+            ConfigKey::NamespaceNaclKey => "c",
+            ConfigKey::StateNaclKey => "d",
+            ConfigKey::ShallowBasis => "e",
+            ConfigKey::MaxObjectSize => "f",
+        }
+    }
+
+    pub fn from_short_str(short_str: &str) -> Option<ConfigKey> {
+        match short_str {
+            "a" => Some(ConfigKey::Namespace),
+            "b" => Some(ConfigKey::RemoteBranch),
+            "c" => Some(ConfigKey::NamespaceNaclKey),
+            "d" => Some(ConfigKey::StateNaclKey),
+            "e" => Some(ConfigKey::ShallowBasis),
+            "f" => Some(ConfigKey::MaxObjectSize),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigValue::Int64(v) => write!(f, "i64[{}]", v),
+            ConfigValue::String(v) => write!(f, "str[{}]", v),
         }
     }
 }
@@ -157,17 +212,42 @@ impl Args {
 }
 
 impl Config {
-    pub fn new(args: Args) -> Result<Config> {
+    pub fn new(mut args: Args) -> Result<Config> {
         let tracking_repo = args.tracking_repo()?;
         let user_repo = args.user_repo()?;
 
         let mut tracking_config = tracking_repo.config().ok().context("tracking config")?;
-        let user_config = user_repo
+        let mut user_config = user_repo
             .config()
             .ok()
             .context("user config")?
             .snapshot()
             .context("snapshot")?;
+
+        let tok: Vec<_> = args.remote_url.splitn(2, ':').collect();
+        let (remote_url, _tmp) = if tok.len() != 2 || !tok[0].starts_with("0") {
+            (args.remote_url.as_str(), None)
+        } else {
+            let tmp =
+                tempdir::TempDir::new("recursive_remote").context("Unable to create temp dir.")?;
+            let config_path = tmp.path().join("git_config");
+            match crate::embedded_config::parse_into_file(tok[0], &args.remote_name, &config_path) {
+                Ok(..) => {
+                    user_config.add_file(
+                        &config_path,
+                        git2::ConfigLevel::App,
+                        /*force=*/ false,
+                    )?;
+                    (tok[1], Some(tmp))
+                }
+                Err(..) => {
+                    log::warn!("Unable to parse URL \"{}\" for embedded configuration, but heuristics indicate that doing so may be intended.", &args.remote_url);
+                    (args.remote_url.as_str(), None)
+                }
+            }
+        };
+
+        args.remote_url = remote_url.to_string();
 
         let namespace = configure_namespace(&args, &user_config).context("namespace config")?;
         let shallow_basis =

@@ -1,5 +1,6 @@
 extern crate recursive_remote;
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -56,54 +57,57 @@ fn git(bin_dir: &Path) -> std::process::Command {
 }
 
 fn set_config(
+    embed_config: bool,
     flavor: &Flavor,
     config: &mut git2::Config,
-    bin_dir: &Path,
-    workdir: &Path,
-    upstream: &Path,
+    url: &str,
     keys: &EncryptionKeys,
 ) {
-    let upstream = upstream.to_string_lossy();
-    let url = format!("recursive::file://{}", upstream);
-    execute_subprocess2(
-        git(bin_dir)
-            .current_dir(&workdir)
-            .arg("remote")
-            .arg("add")
-            .arg(flavor.remote_name())
-            .arg(&url),
-    )
-    .expect("git remote add");
+    let keygen = |key| {
+        if embed_config {
+            format!("remote.{}", key)
+        } else {
+            format!("remote.{}.{}", flavor.remote_name(), key)
+        }
+    };
 
-    write_config_i64(flavor.remote_name(), ConfigKey::MaxObjectSize, config, 30).unwrap();
-
-    write_config(
-        flavor.remote_name(),
-        ConfigKey::RemoteBranch,
-        config,
-        flavor.branch_name(),
-    )
-    .unwrap();
-
-    if let Some(key) = keys.namespace_key() {
-        write_config(
-            flavor.remote_name(),
-            ConfigKey::NamespaceNaclKey,
-            config,
-            &key.serialize_to_string(),
+    config
+        .set_i64(&keygen(ConfigKey::MaxObjectSize.as_ref()), 30)
+        .unwrap();
+    config
+        .set_str(
+            &keygen(ConfigKey::RemoteBranch.as_ref()),
+            flavor.branch_name(),
         )
         .unwrap();
+
+    if let Some(key) = keys.namespace_key() {
+        config
+            .set_str(
+                &keygen(ConfigKey::NamespaceNaclKey.as_ref()),
+                &key.serialize_to_string(),
+            )
+            .unwrap();
     }
 
     if let Some(key) = keys.state_key() {
-        write_config(
-            flavor.remote_name(),
-            ConfigKey::StateNaclKey,
-            config,
-            &key.serialize_to_string(),
-        )
-        .unwrap();
+        config
+            .set_str(
+                &keygen(ConfigKey::StateNaclKey.as_ref()),
+                &key.serialize_to_string(),
+            )
+            .unwrap();
     }
+}
+
+fn set_common_config(flavor: &Flavor, config: &mut git2::Config, url: &str) {
+    let keygen = |key| format!("remote.{}.{}", flavor.remote_name(), key);
+
+    config.set_str(&keygen("url"), &url).unwrap();
+
+    config
+        .set_str(&keygen("fetch"), "+refs/heads/*:refs/remotes/origin/*")
+        .unwrap();
 }
 
 enum Flavor {
@@ -143,26 +147,78 @@ impl Flavor {
 }
 
 #[test]
+fn roundtrip_cleartext_embed() {
+    roundtrip(
+        &Flavor::Plain,
+        /*do_conflict=*/ false,
+        /*embed_config=*/ true,
+    );
+}
+
+#[test]
+fn roundtrip_cleartext_conflict_embed() {
+    roundtrip(
+        &Flavor::Plain,
+        /*do_conflict=*/ true,
+        /*embed_config=*/ true,
+    );
+}
+
+#[test]
+fn roundtrip_crypttext_embed() {
+    roundtrip(
+        &Flavor::Encrypted,
+        /*do_conflict=*/ false,
+        /*embed_config=*/ true,
+    );
+}
+
+#[test]
+fn roundtrip_crypttext_conflict_embed() {
+    roundtrip(
+        &Flavor::Encrypted,
+        /*do_conflict=*/ true,
+        /*embed_config=*/ true,
+    );
+}
+
+#[test]
 fn roundtrip_cleartext() {
-    roundtrip(&Flavor::Plain, /*do_conflict=*/ false);
+    roundtrip(
+        &Flavor::Plain,
+        /*do_conflict=*/ false,
+        /*embed_config=*/ false,
+    );
 }
 
 #[test]
 fn roundtrip_cleartext_conflict() {
-    roundtrip(&Flavor::Plain, /*do_conflict=*/ true);
+    roundtrip(
+        &Flavor::Plain,
+        /*do_conflict=*/ true,
+        /*embed_config=*/ false,
+    );
 }
 
 #[test]
 fn roundtrip_crypttext() {
-    roundtrip(&Flavor::Encrypted, /*do_conflict=*/ false);
+    roundtrip(
+        &Flavor::Encrypted,
+        /*do_conflict=*/ false,
+        /*embed_config=*/ false,
+    );
 }
 
 #[test]
 fn roundtrip_crypttext_conflict() {
-    roundtrip(&Flavor::Encrypted, /*do_conflict=*/ true);
+    roundtrip(
+        &Flavor::Encrypted,
+        /*do_conflict=*/ true,
+        /*embed_config=*/ false,
+    );
 }
 
-fn roundtrip(flavor: &Flavor, do_conflict: bool) {
+fn roundtrip(flavor: &Flavor, do_conflict: bool, embed_config: bool) {
     let td = tempdir::TempDir::new("rust-test").unwrap();
     let bin_dir = td.path().join("bin");
 
@@ -179,23 +235,35 @@ fn roundtrip(flavor: &Flavor, do_conflict: bool) {
 
     let keys = flavor.gen_keys();
 
-    set_config(
-        flavor,
-        &mut user_repo1.config().unwrap(),
-        &bin_dir,
-        &workdir1,
-        &upstream_repo.path(),
-        &keys,
-    );
+    let upstream = upstream_repo.path().to_string_lossy();
+    let url = if embed_config {
+        format!("file://{}", upstream)
+    } else {
+        format!("recursive::file://{}", upstream)
+    };
 
-    set_config(
-        flavor,
-        &mut user_repo2.config().unwrap(),
-        &bin_dir,
-        &workdir2,
-        &upstream_repo.path(),
-        &keys,
-    );
+    let set_rr_config = |config| {
+        set_config(embed_config, flavor, config, &url, &keys);
+    };
+
+    let url = if embed_config {
+        let path = td.path().join("embed");
+        let mut config = git2::Config::open(&path).unwrap();
+        set_rr_config(&mut config);
+        let embedded = recursive_remote::embedded_config::embed_file(&path).unwrap();
+        format!("recursive::{}:{}", &embedded, &url)
+    } else {
+        let mut config1 = user_repo1.config().unwrap();
+        let mut config2 = user_repo2.config().unwrap();
+        set_rr_config(&mut config1);
+        set_rr_config(&mut config2);
+        url
+    };
+
+    let mut config1 = user_repo1.config().unwrap();
+    let mut config2 = user_repo2.config().unwrap();
+    set_common_config(flavor, &mut config1, &url);
+    set_common_config(flavor, &mut config2, &url);
 
     pretty_print(
         git(&bin_dir)

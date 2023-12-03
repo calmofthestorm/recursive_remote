@@ -1,5 +1,5 @@
-use std::io::BufRead;
-
+use std::io::{BufRead as _, Read as _};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
@@ -150,7 +150,10 @@ fn main() -> Result<()> {
         .version(&*version)
         .author(authors)
         .arg_from_usage("-c, --configuration 'Prints configuration information/examples.'")
+        .arg_from_usage("-g, --generate-configuration 'Prints an example config for embedding.'")
         .arg_from_usage("-d, --debug 'Dumps tracking repository state.'")
+        .arg_from_usage("-e, --embed-configuration=[config] 'Encodes the recursive remote options under the [remote] section in git config file [config] into a format that can be used in place of the remote spec for git clone, etc. Use -g for an example.'")
+        .arg_from_usage("-p, --parse-configuration=[config] 'Parses the encoded configuration [config] and prints the corresponding git config.'")
         .arg_from_usage("[remote_name_passed_from_git]")
         .arg_from_usage("[remote_spec_passed_from_git]");
 
@@ -158,6 +161,51 @@ fn main() -> Result<()> {
 
     if matches.contains_id("configuration") {
         recursive_remote::config::print_configuration_guidance();
+        Ok(())
+    } else if matches.contains_id("embed-configuration") {
+        let path = matches
+            .get_one::<String>("embed-configuration")
+            .expect("Logic error");
+        let entries = recursive_remote::embedded_config::embed_file(&PathBuf::from(path))
+            .with_context(|| format!("embed git config file {}", &path))?;
+        for (embedded, url) in entries.into_values() {
+            let url = url.unwrap_or_default();
+            let url = if url.starts_with("recursive::") {
+                &url[11..]
+            } else {
+                &url[..]
+            };
+            println!("recursive::{}:{}", &embedded, &url);
+        }
+        Ok(())
+    } else if matches.contains_id("parse-configuration") {
+        let embedded = matches
+            .get_one::<String>("parse-configuration")
+            .expect("Logic error");
+        let mut embedded = &embedded[..];
+        if embedded.starts_with("recursive::") {
+            embedded = &embedded[11..];
+        }
+        let tok: Vec<_> = embedded.splitn(2, ':').collect();
+        if tok.len() == 2 && embedded.starts_with("0") {
+            match recursive_remote::embedded_config::parse(tok[0], "remote_name") {
+                Ok(parsed) => {
+                    println!("{}", &parsed);
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!("Unable to parse embedded configuration, but heuristics indicate that doing so may be intended: {}", e);
+                }
+            }
+        }
+        eprintln!("No valid embedded config was specified.");
+        Ok(())
+    } else if matches.contains_id("generate-configuration") {
+        println!("[remote]");
+        println!("\trecursive-remote-branch = main");
+        println!("\trecursive-namespace = my_repo");
+        println!("\trecursive-namespace-nacl-key = file://.creds/nacl_namespace");
+        println!("\trecursive-state-nacl-key = file://.creds/nacl_state");
         Ok(())
     } else {
         match (
