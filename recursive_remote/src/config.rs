@@ -316,6 +316,11 @@ fn configure_nacl_key_file(value: &str) -> Result<Option<eseb::SymmetricKey>> {
             fd.read_to_string(&mut s).context("Failed to read key.")?;
             eseb::SymmetricKey::from_str(s.trim()).context("decode key")?
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && value.starts_with("~/") => {
+            let home = std::env::var("HOME").context("read env var HOME")?;
+            let value = PathBuf::from(home).join(&value[2..]);
+            return configure_nacl_key_file(&*value.to_string_lossy());
+        }
         Err(e) => return Err(e.into()),
     };
 
