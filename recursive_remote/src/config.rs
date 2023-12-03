@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -9,7 +8,6 @@ use log::{info, trace};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
-use crate::embedded_config::*;
 use crate::serialization::Ref;
 use crate::util::*;
 

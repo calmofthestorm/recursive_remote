@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};

@@ -1,14 +1,11 @@
 extern crate recursive_remote;
 
-use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use eseb::KeyMaterial;
-use recursive_remote::config::{
-    write_config, write_config_i64, ConfigKey, EncryptionKeys, EncryptionKeysInner,
-};
+use recursive_remote::config::{ConfigKey, EncryptionKeys, EncryptionKeysInner};
 
 // FIXME: Share with non-test code.
 fn debug_stream_message<S: Read>(stream: Option<S>, sn: &'static str) -> Result<String> {
@@ -56,12 +53,7 @@ fn git(bin_dir: &Path) -> std::process::Command {
     c
 }
 
-fn set_config(
-    flavor: &Flavor,
-    config: &mut git2::Config,
-    url: &str,
-    keys: &EncryptionKeys,
-) {
+fn set_config(flavor: &Flavor, config: &mut git2::Config, keys: &EncryptionKeys) {
     let keygen = |key| format!("remote.{}.{}", flavor.remote_name(), key);
 
     config
@@ -236,7 +228,7 @@ fn roundtrip(flavor: &Flavor, do_conflict: bool, embed_config: bool) {
     };
 
     let set_rr_config = |config| {
-        set_config(flavor, config, &url, &keys);
+        set_config(flavor, config, &keys);
     };
 
     let url = if embed_config {

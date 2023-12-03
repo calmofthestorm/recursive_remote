@@ -1,6 +1,5 @@
 [workspace]
 members = [
-        "common",
         "recursive_remote",
     ]
 resolver = "2"
