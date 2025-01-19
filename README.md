@@ -8,7 +8,7 @@ Use a git branch as an (encrypted) upstream for git repos.
   * (Optionally) has a separate encryption key.
 * Uses a SHA256 Merkle tree to incrementally update encrypted data.
 * Each upstream branch may be clear, or symmetrically encrypted using [NaCl](http://nacl.cr.yp.to/).
-* Does not rewrite history, making it compatible with branch protection.
+* Does not rewrite history (on the upstream repository), making it compatible with branch protection.
 * Shallow basis allows synchronizing large repositories without storing all common objects upstream.
 
 # Limitations
@@ -92,7 +92,7 @@ required. Git uses a combination of whether it's fast forward and the ref/object
 type (see `man git-push` for details) I don't see an easy way to replicate that
 using libgit that doesn't involve re-implementing it. Instead, we create a
 "push_semantics_repo" to mimic the upstream, shell out to git, and see whether
-or not it can push each ref without force. We then require the user to secify
+or not it can push each ref without force. We then require the user to specify
 force if git did.
 
 An alternative would be for me to attempt to implement the same behavior as git.
@@ -101,13 +101,37 @@ brittle.
 
 # Ratcheting
 
-When first connecting to a remote, we trust-on-first-use the current history of
-the upstream. From then on, only fast-forward updates are permitted. This uses
-both the SHA1 from git and the SHA256 we check internally. In practical terms,
-this means that if the upstream is regenerated (such as to manually garbage
-collect), repos will refuse to update, failing with a ratcheting error. You can
-`rm -fr .git/recursive_remote` to erase that state and once again
-trust-on-first-use.
+When first connecting to a remote, we download the current history of
+the upstream branch. From then on, only fast forward updates are accepted. This
+ensures that if two clients attempt to update the inner repositories stored on
+that branch at the same time, one succeeds and one fails. When a push fails, the
+client will fetch the current state from upstream, apply its changes, then push
+again. This can always be resolved automatically unless there is a conflict
+between inner branches. This is exactly the same as when it happens with vanilla
+Git, and will be presented to the user for resolution in the same way.
+
+In short, it should just work like a normal Git remote.
+
+When cloning a branch for the first time, recursive remote has to use the SHA1,
+because it does not know the SHA256 of the branch yet[^4]. From then on, it
+validates all updates it receives using a SHA256 Merkle tree, meaning it will
+detect any SHA1 collisions in the upstream as corruption. This is a
+trust-on-first-use behavior where the initial pull relies on the security of
+SHA1 in the same way as vanilla Git does, but all future updates should be
+protected by SHA256.
+
+It is vanishingly unlikely that a SHA1 collision would occur by random chance,
+especially given the performance and storage overhead of recursive remote mean
+that repositories are unlikely to reach the size that, say, Bup repos can. In
+any case, the risk of a collision in the underlying repo is comparable to the
+risk of one in the inner repo it stores (because they have a simliar number of
+objects). Thus, I consider this a potential security vulnerability but not a
+problem for correctness.
+
+In practical terms, this means that if the upstream is regenerated (such as to
+manually garbage collect), repos will refuse to update, failing with a
+ratcheting error. You can `rm -fr .git/recursive_remote` to erase that state and
+once again trust-on-first-use.
 
 # Shallow Basis
 
@@ -151,7 +175,7 @@ All configuration is done through Git's config system. The following configurati
 * Encryption keys may be stored in a file with 'file://path/to/file'.
   * If the file does not exist, a random key will be generated and written to that path.
   * This is convenient if you want to commit the keys in the repository so that any clone can access the encrypted remote.
-  * Keys may be generated explicitly using [eseb](https://github.com/calmofthestorm/eseb), or implicitly by pointing to a non-existant file or setting them to the empty string.
+  * Keys may be generated explicitly using [eseb](https://github.com/calmofthestorm/eseb), or implicitly by pointing to a non-existent file or setting them to the empty string.
   
 ## Examples
 
@@ -312,3 +336,7 @@ git config gcrypt.gpg-args "--homedir .gnupg"
     that is explicitly marked as a basis via the `recursive-shallow-basis`
     config option. Thus, marking a rev as basis just pretends it exists on the
     remote.
+
+[^4]: I suppose some kind of UI could be added to require the user to specify
+    both SHA1 and SHA256 on the initial pull, but trust-on-first-use is good
+    enough for my threat model.
