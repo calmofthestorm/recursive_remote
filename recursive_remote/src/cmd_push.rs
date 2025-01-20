@@ -332,7 +332,6 @@ pub fn push(config: &Config, specs: &Vec<String>) -> Result<()> {
                         println!("error {} rejected\n", &name);
                     }
                 }
-                println!("");
 
                 return Ok(());
             }
