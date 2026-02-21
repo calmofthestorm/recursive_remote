@@ -13,6 +13,31 @@ use recursive_remote::util::*;
 
 include!(concat!(env!("OUT_DIR"), "/generated_stamp.rs"));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolCommand {
+    Capabilities,
+    List,
+    Push,
+    Fetch,
+    Ignore,
+}
+
+fn parse_protocol_command(line: &str) -> ProtocolCommand {
+    let mut tok = line.split_ascii_whitespace();
+    let command = tok.next().unwrap_or_default();
+    if command == "capabilities" {
+        ProtocolCommand::Capabilities
+    } else if command.starts_with("list") {
+        ProtocolCommand::List
+    } else if command.starts_with("push") {
+        ProtocolCommand::Push
+    } else if command.starts_with("fetch") {
+        ProtocolCommand::Fetch
+    } else {
+        ProtocolCommand::Ignore
+    }
+}
+
 fn collect_lines<I>(lines: &mut I, key: &str, initial: Option<String>) -> Result<Vec<String>>
 where
     I: Iterator<Item = Result<String, std::io::Error>>,
@@ -39,6 +64,59 @@ where
     }
 }
 
+fn handle_capabilities() {
+    println!("push\nfetch\n");
+}
+
+fn handle_list(config: &Config) -> Result<()> {
+    let (_, state, _basis_state, _root_id, _commit_id) = update_branches(config)?;
+    let namespace = state
+        .namespace(
+            &config.namespace,
+            &config.nacl_keys,
+            &Rc::new(config.tracking_repo()?),
+        )?
+        .unwrap_or_else(Namespace::new);
+    for (name, target) in namespace.refs.iter() {
+        trace!("\t{} -> {}", &name, &target.to_git_wire_string());
+        println!("{} {}", &target.to_git_wire_string(), &name);
+    }
+    println!("");
+    Ok(())
+}
+
+fn handle_push<I>(config: &Config, lines: &mut I, line: String) -> Result<()>
+where
+    I: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let pushes = collect_lines(lines, "push", Some(line)).context("push collect")?;
+    recursive_remote::cmd_push::push(config, &pushes).context("Failed to push.")
+}
+
+fn handle_fetch<I>(config: &Config, lines: &mut I, line: String) -> Result<()>
+where
+    I: Iterator<Item = Result<String, std::io::Error>>,
+{
+    let fetches = collect_lines(lines, "fetch", Some(line)).context("fetch collect")?;
+    recursive_remote::cmd_fetch::fetch(config, &fetches).context("Failed to fetch.")
+}
+
+fn dispatch_protocol_command<I>(config: &Config, lines: &mut I, line: String) -> Result<()>
+where
+    I: Iterator<Item = Result<String, std::io::Error>>,
+{
+    match parse_protocol_command(&line) {
+        ProtocolCommand::Capabilities => {
+            handle_capabilities();
+            Ok(())
+        }
+        ProtocolCommand::List => handle_list(config),
+        ProtocolCommand::Push => handle_push(config, lines, line),
+        ProtocolCommand::Fetch => handle_fetch(config, lines, line),
+        ProtocolCommand::Ignore => Ok(()),
+    }
+}
+
 fn report_error(result: Result<()>) -> bool {
     match result {
         Ok(()) => true,
@@ -49,78 +127,54 @@ fn report_error(result: Result<()>) -> bool {
     }
 }
 
-fn initialize_state_repo(args: Args) -> Result<Config> {
-    info!("Tracking repository is {:?}.", &args.tracking_repo_path);
+fn cleanup_keep_files(pack_dir: &std::path::Path) -> Result<()> {
+    for fp in std::fs::read_dir(pack_dir)
+        .with_context(|| format!("read pack_dir {}", pack_dir.display()))?
+    {
+        let fp = fp.context("read dirent")?;
+        let fp = fp.path();
+        if let Some(ext) = fp.extension() {
+            if ext == "keep" {
+                std::fs::remove_file(&fp)
+                    .with_context(|| format!("remove keep file {}", fp.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
 
-    let all_ops_success = std::thread::scope(|scope| {
-        let t1 = scope.spawn(|| {
-            report_error((|| {
-                {
-                    let repo = args.tracking_repo()?;
-                    let mut config = repo.config()?;
-                    config.set_i64("gc.auto", 6700)?;
-                    config.set_bool("gc.autoDetach", false)?;
-                }
-                git_gc_auto(&args.tracking_repo_path).context("git gc --auto")?;
-                args.tracking_repo()?.config()?.set_i64("gc.auto", 0)?;
-                Ok(())
-            })())
-        });
+fn git_gc_auto_with_config_impl<F>(repo: &mut gix::Repository, mut run_gc: F) -> Result<()>
+where
+    F: FnMut(&std::path::Path) -> Result<()>,
+{
+    let mut config = repo.config_snapshot().plumbing().clone();
+    let config_path = config
+        .meta()
+        .path
+        .as_ref()
+        .expect("config path")
+        .to_path_buf();
 
-        let t2 = scope.spawn(|| {
-            report_error((|| {
-                {
-                    let repo = args.push_semantics_repo()?;
-                    let mut config = repo.config()?;
-                    config.set_i64("gc.auto", 6700)?;
-                    config.set_bool("gc.autoDetach", false)?;
-                }
-                git_gc_auto(&args.push_semantics_repo_path).context("git gc --auto")?;
-                args.push_semantics_repo()?
-                    .config()?
-                    .set_i64("gc.auto", 0)?;
+    config.set_raw_value(&"gc.auto", "6700")?;
+    config.set_raw_value(&"gc.autoDetach", "false")?;
+    config.write_to(&mut std::fs::File::create(&config_path)?)?;
 
-                Ok(())
-            })())
-        });
+    run_gc(repo.path()).context("git gc --auto")?;
 
-        let t3 = scope.spawn(|| {
-            report_error((|| {
-                {
-                    let repo = args.all_objects_ever_repo()?;
-                    let mut config = repo.config()?;
-                    config.set_i64("gc.auto", 6700)?;
-                    config.set_bool("gc.autoDetach", false)?;
-                }
+    config.set_raw_value(&"gc.auto", "0")?;
+    config.write_to(&mut std::fs::File::create(&config_path)?)?;
 
-                // Clean up .keep files. In theory we no longer need to create
-                // them during fetch.
-                let pack_dir = args.all_objects_ever_repo_path.join("objects/pack");
-                for fp in std::fs::read_dir(&pack_dir)
-                    .with_context(|| format!("read pack_dir {}", pack_dir.display()))?
-                {
-                    let fp = fp.context("read dirent")?;
-                    let fp = fp.path();
-                    if let Some(ext) = fp.extension() {
-                        if ext == "keep" {
-                            std::fs::remove_file(&fp)
-                                .with_context(|| format!("remove keep file {}", fp.display()))?;
-                        }
-                    }
-                }
+    Ok(())
+}
 
-                git_gc_auto(&args.all_objects_ever_repo_path).context("git gc --auto")?;
-                args.all_objects_ever_repo()?
-                    .config()?
-                    .set_i64("gc.auto", 0)?;
+pub fn git_gc_auto_with_config(repo: &mut gix::Repository) -> Result<()> {
+    git_gc_auto_with_config_impl(repo, git_gc_auto)
+}
 
-                Ok(())
-            })())
-        });
-
-        t1.join().and(t2.join()).and(t3.join())
-    });
-
+fn finalize_initialize_state_repo(
+    all_ops_success: std::thread::Result<bool>,
+    args: Args,
+) -> Result<Config> {
     match all_ops_success {
         Ok(true) => Config::new(args),
         Ok(false) => {
@@ -130,6 +184,31 @@ fn initialize_state_repo(args: Args) -> Result<Config> {
             anyhow::bail!("Failed to join initialize threads.");
         }
     }
+}
+
+fn initialize_state_repo(args: Args) -> Result<Config> {
+    info!("Tracking repository is {:?}.", &args.tracking_repo_path);
+
+    let all_ops_success = std::thread::scope(|scope| {
+        let t1 = scope
+            .spawn(|| report_error((|| git_gc_auto_with_config(&mut args.tracking_repo()?))()));
+
+        let t2 = scope.spawn(|| {
+            report_error((|| {
+                git_gc_auto_with_config(&mut args.all_objects_ever_repo()?)?;
+
+                // Clean up .keep files. In theory we no longer need to create
+                // them during fetch.
+                let pack_dir = args.all_objects_ever_repo_path.join("objects/pack");
+                cleanup_keep_files(&pack_dir)?;
+
+                Ok(())
+            })())
+        });
+
+        t1.join().and(t2.join())
+    });
+    finalize_initialize_state_repo(all_ops_success, args)
 }
 
 fn main() -> Result<()> {
@@ -194,7 +273,10 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("Unable to parse embedded configuration, but heuristics indicate that doing so may be intended: {}", e);
+                    log::warn!(
+                        "Unable to parse embedded configuration, but heuristics indicate that doing so may be intended: {}",
+                        e
+                    );
                 }
             }
         }
@@ -340,7 +422,7 @@ fn do_debug_dump(config: &Config) -> Result<()> {
     }
 
     // let repo_path = matches.get_one::<PathBuf>("remote_repo_path").context("No path to a repo specified to dump.")?;
-    // let tracking_repo = Rc::new(git2::Repository::open_bare(&repo_path).context("open bare git tracking repo")?);
+    // let tracking_repo = Rc::new(gix::Repository::open_bare(&repo_path).context("open bare git tracking repo")?);
 
     // // Just brute force for dumping namespace content.
     // let mut keys: Vec<_> = match matches.get_one::<String>("key_file_first_line_is_state_rest_namespace") {
@@ -414,37 +496,7 @@ fn git_special_remote_main(remote_name: &str, remote_spec: &str, debug_dump: boo
         match lines.next() {
             Some(Ok(line)) => {
                 trace!("Received command: {:?}", &line);
-
-                let mut tok = line.split_ascii_whitespace();
-                let command = tok.next().unwrap_or_default();
-
-                if command == "capabilities" {
-                    println!("push\nfetch\n");
-                } else if command.starts_with("list") {
-                    let (_, state, _basis_state, _root_id, _commit_id) = update_branches(&config)?;
-                    let namespace = state
-                        .namespace(
-                            &config.namespace,
-                            &config.nacl_keys,
-                            &Rc::new(config.tracking_repo()?),
-                        )?
-                        .unwrap_or_else(Namespace::new);
-                    for (name, target) in namespace.refs.iter() {
-                        trace!("\t{} -> {}", &name, &target.to_git_wire_string());
-                        println!("{} {}", &target.to_git_wire_string(), &name);
-                    }
-                    println!("");
-                } else if command.starts_with("push") {
-                    let pushes =
-                        collect_lines(&mut lines, "push", Some(line)).context("push collect")?;
-                    recursive_remote::cmd_push::push(&config, &pushes)
-                        .context("Failed to push.")?;
-                } else if command.starts_with("fetch") {
-                    let fetches =
-                        collect_lines(&mut lines, "fetch", Some(line)).context("fetch collect")?;
-                    recursive_remote::cmd_fetch::fetch(&config, &fetches)
-                        .context("Failed to fetch.")?;
-                }
+                dispatch_protocol_command(&config, &mut lines, line)?;
             }
             None => break,
             Some(Err(e)) => panic!("Error: {:?}", &e),
@@ -452,4 +504,178 @@ fn git_special_remote_main(remote_name: &str, remote_spec: &str, debug_dump: boo
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok_lines(lines: &[&str]) -> impl Iterator<Item = Result<String, std::io::Error>> {
+        lines
+            .iter()
+            .map(|line| Ok::<String, std::io::Error>((*line).to_string()))
+    }
+
+    #[test]
+    fn collect_lines_collects_matching_key_until_blank() {
+        let mut lines = ok_lines(&["push refs/heads/a:refs/heads/a", "  ", "ignored"]);
+        let out = collect_lines(
+            &mut lines,
+            "push",
+            Some("push refs/heads/main:refs/heads/main".to_string()),
+        )
+        .expect("collect");
+        assert_eq!(
+            out,
+            vec![
+                "push refs/heads/main:refs/heads/main".to_string(),
+                "push refs/heads/a:refs/heads/a".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_lines_errors_on_non_blank_non_matching_line() {
+        let mut lines = ok_lines(&["fetch deadbeef main", "unexpected"]);
+        let err = collect_lines(&mut lines, "fetch", None).expect_err("must fail");
+        assert!(format!("{err}").contains("expected blank line while collecting"));
+    }
+
+    #[test]
+    fn collect_lines_returns_accumulated_when_stream_ends() {
+        let mut lines = ok_lines(&["push refs/heads/a:refs/heads/a"]);
+        let out = collect_lines(
+            &mut lines,
+            "push",
+            Some("push refs/heads/main:refs/heads/main".to_string()),
+        )
+        .expect("collect");
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn collect_lines_propagates_iterator_errors() {
+        let err = std::io::Error::other("read failed");
+        let mut lines = vec![Err(err)].into_iter();
+        let out = collect_lines(&mut lines, "push", None).expect_err("must fail");
+        assert!(format!("{out}").contains("Error"));
+    }
+
+    #[test]
+    fn report_error_returns_true_on_ok_and_false_on_err() {
+        assert!(report_error(Ok(())));
+        assert!(!report_error(Err(anyhow::anyhow!("boom"))));
+    }
+
+    #[test]
+    fn parse_protocol_command_classifies_expected_commands() {
+        assert_eq!(
+            parse_protocol_command("capabilities"),
+            ProtocolCommand::Capabilities
+        );
+        assert_eq!(
+            parse_protocol_command("list for-push"),
+            ProtocolCommand::List
+        );
+        assert_eq!(
+            parse_protocol_command("push refs/heads/main:refs/heads/main"),
+            ProtocolCommand::Push
+        );
+        assert_eq!(
+            parse_protocol_command("fetch deadbeef refs/heads/main"),
+            ProtocolCommand::Fetch
+        );
+        assert_eq!(
+            parse_protocol_command("unknown whatever"),
+            ProtocolCommand::Ignore
+        );
+        assert_eq!(parse_protocol_command(""), ProtocolCommand::Ignore);
+    }
+
+    fn tmp_args() -> Args {
+        let root = std::path::PathBuf::from("/tmp/recursive-remote-main-tests");
+        Args {
+            user_repo_path: root.join("user"),
+            tracking_repo_path: root.join("tracking"),
+            all_objects_ever_repo_path: root.join("all"),
+            remote_name: "origin".to_string(),
+            lock_path: root.join("locks"),
+            state_path: root.join("state"),
+            remote_url: "file:///tmp/upstream".to_string(),
+        }
+    }
+
+    #[test]
+    fn cleanup_keep_files_removes_only_keep_extension() {
+        let tmp = tempfile::Builder::new()
+            .prefix("main-cleanup-tests")
+            .tempdir()
+            .expect("tempdir");
+        let pack_dir = tmp.path().join("objects/pack");
+        std::fs::create_dir_all(&pack_dir).expect("mkdir");
+
+        let keep = pack_dir.join("pack-a.keep");
+        let idx = pack_dir.join("pack-a.idx");
+        std::fs::write(&keep, b"x").expect("write keep");
+        std::fs::write(&idx, b"y").expect("write idx");
+
+        cleanup_keep_files(&pack_dir).expect("cleanup");
+
+        assert!(!keep.exists());
+        assert!(idx.exists());
+    }
+
+    #[test]
+    fn git_gc_auto_with_config_impl_sets_and_resets_gc_auto_on_success() {
+        let tmp = tempfile::Builder::new()
+            .prefix("main-gc-tests")
+            .tempdir()
+            .expect("tempdir");
+        let mut repo = gix::init_bare(tmp.path().join("repo")).expect("init bare repo");
+        let mut ran = false;
+        git_gc_auto_with_config_impl(&mut repo, |_| {
+            ran = true;
+            Ok(())
+        })
+        .expect("gc with config");
+        assert!(ran);
+
+        let config_path = repo.path().join("config");
+        let config_text = std::fs::read_to_string(config_path).expect("config");
+        assert!(config_text.contains("auto = 0"));
+        assert!(config_text.contains("autoDetach = false"));
+    }
+
+    #[test]
+    fn git_gc_auto_with_config_impl_propagates_gc_failure() {
+        let tmp = tempfile::Builder::new()
+            .prefix("main-gc-tests")
+            .tempdir()
+            .expect("tempdir");
+        let mut repo = gix::init_bare(tmp.path().join("repo")).expect("init bare repo");
+        let err = git_gc_auto_with_config_impl(&mut repo, |_| Err(anyhow::anyhow!("gc failed")))
+            .expect_err("must fail");
+        assert!(format!("{err}").contains("git gc --auto"));
+    }
+
+    #[test]
+    fn finalize_initialize_state_repo_reports_false_thread_status() {
+        let args = tmp_args();
+        let err = finalize_initialize_state_repo(Ok(false), args)
+            .err()
+            .expect("must fail");
+        assert!(format!("{err}").contains("initialize threaded operation failed"));
+    }
+
+    #[test]
+    fn finalize_initialize_state_repo_reports_join_panic() {
+        let args = tmp_args();
+        let join_err = std::thread::spawn(|| -> bool { panic!("boom") })
+            .join()
+            .expect_err("must panic");
+        let err = finalize_initialize_state_repo(Err(join_err), args)
+            .err()
+            .expect("must fail");
+        assert!(format!("{err}").contains("Failed to join initialize threads"));
+    }
 }

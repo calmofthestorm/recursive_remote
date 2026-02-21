@@ -1,9 +1,15 @@
+use std::borrow::Cow;
+use std::convert::TryFrom;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use eseb::KeyMaterial;
+use gix::diff::object::bstr::BStr;
+use gix_config::file::Metadata;
+use gix_config::file::init::Options;
+use gix_config::parse::section::ValueName;
 use log::{info, trace};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -25,14 +31,13 @@ pub enum ConfigKey {
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
 pub enum ConfigValue {
-    String(String),
+    String(Cow<'static, str>),
     Int64(i64),
 }
 
 pub struct Args {
     pub user_repo_path: PathBuf,
     pub tracking_repo_path: PathBuf,
-    pub push_semantics_repo_path: PathBuf,
     pub all_objects_ever_repo_path: PathBuf,
     pub remote_name: String,
     pub lock_path: PathBuf,
@@ -49,6 +54,13 @@ pub struct EncryptionKeysInner {
     pub namespace_key: eseb::SymmetricKey,
 }
 
+impl TryInto<ValueName<'static>> for ConfigKey {
+    type Error = <ValueName<'static> as TryFrom<&'static str>>::Error;
+    fn try_into(self) -> std::result::Result<ValueName<'static>, Self::Error> {
+        self.name().try_into()
+    }
+}
+
 impl std::fmt::Display for ConfigKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_ref())
@@ -57,6 +69,12 @@ impl std::fmt::Display for ConfigKey {
 
 impl AsRef<str> for ConfigKey {
     fn as_ref(&self) -> &'static str {
+        self.name()
+    }
+}
+
+impl ConfigKey {
+    pub fn name(&self) -> &'static str {
         match self {
             ConfigKey::Namespace => "recursive-namespace",
             ConfigKey::RemoteBranch => "recursive-remote-branch",
@@ -66,9 +84,7 @@ impl AsRef<str> for ConfigKey {
             ConfigKey::MaxObjectSize => "recursive-max-object-size",
         }
     }
-}
 
-impl ConfigKey {
     pub fn is_i64(&self) -> bool {
         match self {
             ConfigKey::Namespace => false,
@@ -152,7 +168,6 @@ pub struct Config {
     pub remote_name: String,
     pub tracking_ref: String,
     pub all_objects_ever_repo_path: PathBuf,
-    pub push_semantics_repo_path: PathBuf,
     pub state_path: PathBuf,
     pub lock_path: PathBuf,
     pub pushing_ref: String,
@@ -174,7 +189,6 @@ impl Args {
 
         let state_path = user_repo_path.join("recursive_remote");
         let tracking_repo_path = state_path.join("tracking_repo");
-        let push_semantics_repo_path = state_path.join("push_semantics_repo");
         let all_objects_ever_repo_path = state_path.join("all_objects_ever_repo");
         let lock_path = state_path.join("locks");
 
@@ -182,7 +196,6 @@ impl Args {
             user_repo_path,
             lock_path,
             tracking_repo_path,
-            push_semantics_repo_path,
             all_objects_ever_repo_path,
             state_path,
             remote_name: remote_name.to_string(),
@@ -190,20 +203,15 @@ impl Args {
         })
     }
 
-    pub fn user_repo(&self) -> Result<git2::Repository> {
+    pub fn user_repo(&self) -> Result<gix::Repository> {
         open_create_bare_repository(&self.user_repo_path).context("open user repo.")
     }
 
-    pub fn tracking_repo(&self) -> Result<git2::Repository> {
+    pub fn tracking_repo(&self) -> Result<gix::Repository> {
         open_create_bare_repository(&self.tracking_repo_path).context("open user repo.")
     }
 
-    pub fn push_semantics_repo(&self) -> Result<git2::Repository> {
-        open_create_bare_repository(&self.push_semantics_repo_path)
-            .context("open push semantics repo.")
-    }
-
-    pub fn all_objects_ever_repo(&self) -> Result<git2::Repository> {
+    pub fn all_objects_ever_repo(&self) -> Result<gix::Repository> {
         open_create_bare_repository(&self.all_objects_ever_repo_path)
             .context("open all_objects_ever repo.")
     }
@@ -214,32 +222,34 @@ impl Config {
         let tracking_repo = args.tracking_repo()?;
         let user_repo = args.user_repo()?;
 
-        let mut tracking_config = tracking_repo.config().ok().context("tracking config")?;
-        let mut user_config = user_repo
-            .config()
-            .ok()
-            .context("user config")?
-            .snapshot()
-            .context("snapshot")?;
+        let mut tracking_config = tracking_repo.config_snapshot().plumbing().clone();
+        let mut user_config = user_repo.config_snapshot().plumbing().clone();
 
         let tok: Vec<_> = args.remote_url.splitn(2, ':').collect();
         let (remote_url, _tmp) = if tok.len() != 2 || !tok[0].starts_with("0") {
             (args.remote_url.as_str(), None)
         } else {
-            let tmp =
-                tempdir::TempDir::new("recursive_remote").context("Unable to create temp dir.")?;
+            let tmp = tempfile::Builder::new()
+                .prefix("recursive_remote")
+                .tempdir()
+                .context("Unable to create temp dir.")?;
             let config_path = tmp.path().join("git_config");
             match crate::embedded_config::parse_into_file(tok[0], &args.remote_name, &config_path) {
                 Ok(..) => {
-                    user_config.add_file(
-                        &config_path,
-                        git2::ConfigLevel::App,
-                        /*force=*/ false,
-                    )?;
+                    let config = gix_config::File::from_paths_metadata(
+                        Some(Metadata::default().at(config_path)),
+                        Options::default(),
+                    )?
+                    .unwrap();
+
+                    user_config.append(config);
                     (tok[1], Some(tmp))
                 }
                 Err(..) => {
-                    log::warn!("Unable to parse URL \"{}\" for embedded configuration, but heuristics indicate that doing so may be intended.", &args.remote_url);
+                    log::warn!(
+                        "Unable to parse URL \"{}\" for embedded configuration, but heuristics indicate that doing so may be intended.",
+                        &args.remote_url
+                    );
                     (args.remote_url.as_str(), None)
                 }
             }
@@ -267,32 +277,31 @@ impl Config {
             anyhow::bail!("max_object_size must be <= 1024 * 1024 * 1024");
         }
 
-        clean_tracking_config(&args, &mut tracking_config).context("tracking config clean")?;
+        let subsection: &BStr = args.remote_name.as_bytes().into();
+        tracking_config.remove_section("remote", Some(subsection.into()));
         configure_tracking_config(&args, &user_config, &mut tracking_config)
             .context("configure tracking config")?;
 
         let remote_ref =
             configure_remote_branch(&args, &user_config).context("remote branch config")?;
 
-        let nacl_keys = {
-            let mut mutable_user_config = user_repo.config().ok().context("mutable user config")?;
-            let namespace_key =
-                configure_nacl(ConfigKey::NamespaceNaclKey, &args, &mut mutable_user_config)
-                    .context("nacl namespace key config")?;
-            let state_key =
-                configure_nacl(ConfigKey::StateNaclKey, &args, &mut mutable_user_config)
-                    .context("nacl state key config")?;
-            match (namespace_key, state_key) {
-                (Some(namespace_key), Some(state_key)) => Some(EncryptionKeysInner {
-                    namespace_key,
-                    state_key,
-                }),
-                (None, None) => None,
-                _ => panic!(
-                    "Both or neither of namespace-nacl-key and state-nacl-key must be provided."
-                ),
+        let mut mutable_user_config = user_config.clone();
+        let namespace_key =
+            configure_nacl(ConfigKey::NamespaceNaclKey, &args, &mut mutable_user_config)
+                .context("nacl namespace key config")?;
+        let state_key = configure_nacl(ConfigKey::StateNaclKey, &args, &mut mutable_user_config)
+            .context("nacl state key config")?;
+        let nacl_keys = match (namespace_key, state_key) {
+            (Some(namespace_key), Some(state_key)) => Some(EncryptionKeysInner {
+                namespace_key,
+                state_key,
+            }),
+            (None, None) => None,
+            _ => {
+                panic!("Both or neither of namespace-nacl-key and state-nacl-key must be provided.")
             }
         };
+        user_config = mutable_user_config;
         let nacl_keys = EncryptionKeys { inner: nacl_keys };
 
         let tracking_ref = format!("refs/heads/{}/tracking", &args.remote_name);
@@ -303,12 +312,18 @@ impl Config {
             format!("refs/heads/{}/basis/{}", &args.remote_name, &namespace)
         };
 
+        let mut fd =
+            std::fs::File::create(tracking_config.meta().path.as_ref().expect("config path"))?;
+        tracking_config.write_to(&mut fd)?;
+
+        let mut fd = std::fs::File::create(user_config.meta().path.as_ref().expect("config path"))?;
+        user_config.write_to(&mut fd)?;
+
         Ok(Config {
             namespace,
             user_repo_path: args.user_repo_path,
             tracking_repo_path: args.tracking_repo_path,
             state_path: args.state_path,
-            push_semantics_repo_path: args.push_semantics_repo_path,
             all_objects_ever_repo_path: args.all_objects_ever_repo_path,
             remote_name: args.remote_name,
             remote_url: args.remote_url,
@@ -323,28 +338,23 @@ impl Config {
         })
     }
 
-    pub fn all_objects_ever_repo(&self) -> Result<git2::Repository> {
+    pub fn all_objects_ever_repo(&self) -> Result<gix::Repository> {
         open_create_bare_repository(&self.all_objects_ever_repo_path)
             .context("open all_objects_ever repo.")
     }
 
-    pub fn user_repo(&self) -> Result<git2::Repository> {
+    pub fn user_repo(&self) -> Result<gix::Repository> {
         open_create_bare_repository(&self.user_repo_path).context("open user repo.")
     }
 
-    pub fn tracking_repo(&self) -> Result<git2::Repository> {
+    pub fn tracking_repo(&self) -> Result<gix::Repository> {
         open_create_bare_repository(&self.tracking_repo_path).context("open tracking repo.")
-    }
-
-    pub fn push_semantics_repo(&self) -> Result<git2::Repository> {
-        open_create_bare_repository(&self.push_semantics_repo_path)
-            .context("open push semantics repo.")
     }
 }
 
-fn configure_namespace(args: &Args, git_config: &git2::Config) -> Result<String> {
+fn configure_namespace(args: &Args, git_config: &gix_config::File) -> Result<String> {
     match read_config(args, ConfigKey::Namespace, &git_config)? {
-        Some(namespace) => Ok(namespace),
+        Some(namespace) => Ok(namespace.to_string()),
         None => Ok(String::default()),
     }
 }
@@ -353,7 +363,7 @@ fn configure_nacl_key(
     c_key: ConfigKey,
     value: String,
     args: &Args,
-    git_config: &mut git2::Config,
+    git_config: &mut gix_config::File<'static>,
 ) -> Result<Option<eseb::SymmetricKey>> {
     let key = if value.is_empty() {
         info!(
@@ -408,21 +418,23 @@ fn configure_nacl_key_file(value: &str) -> Result<Option<eseb::SymmetricKey>> {
 pub fn configure_nacl(
     c_key: ConfigKey,
     args: &Args,
-    git_config: &mut git2::Config,
+    git_config: &mut gix_config::File<'static>,
 ) -> Result<Option<eseb::SymmetricKey>> {
     match read_config(args, c_key, &git_config)? {
         None => Ok(None),
-        Some(value) if value.starts_with("file://") => configure_nacl_key_file(&value[7..]),
-        Some(value) => configure_nacl_key(c_key, value, args, git_config),
+        Some(value) if value.starts_with("file://".as_bytes()) => {
+            configure_nacl_key_file(value[7..].to_string().as_str())
+        }
+        Some(value) => configure_nacl_key(c_key, value.to_string(), args, git_config),
     }
 }
 
-pub fn configure_remote_branch(args: &Args, git_config: &git2::Config) -> Result<String> {
+pub fn configure_remote_branch(args: &Args, git_config: &gix_config::File) -> Result<String> {
     Ok(
         match read_config(&args, ConfigKey::RemoteBranch, &git_config)? {
             Some(branch) => {
-                if branch.starts_with("refs/heads/") {
-                    branch
+                if branch.starts_with(b"refs/heads/") {
+                    branch.to_string()
                 } else {
                     format!("refs/heads/{}", &branch)
                 }
@@ -433,13 +445,14 @@ pub fn configure_remote_branch(args: &Args, git_config: &git2::Config) -> Result
 }
 
 pub fn configure_shallow_basis(
-    user_repo: &git2::Repository,
+    user_repo: &gix::Repository,
     args: &Args,
-    git_config: &git2::Config,
+    git_config: &gix_config::File,
 ) -> Result<Vec<Ref>> {
     let mut refs = Vec::default();
     for spec in read_config(&args, ConfigKey::ShallowBasis, &git_config)?
         .unwrap_or_default()
+        .to_string()
         .split_whitespace()
     {
         refs.push(
@@ -450,103 +463,92 @@ pub fn configure_shallow_basis(
     Ok(refs)
 }
 
-pub fn read_config(
+pub fn read_config<'a>(
     args: &Args,
     key: ConfigKey,
-    git_config: &git2::Config,
-) -> Result<Option<String>> {
-    match git_config.get_string(&format!("remote.{}.{}", &args.remote_name, key)) {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(e).context(key),
-    }
+    git_config: &'a gix_config::File,
+) -> Result<Option<Cow<'a, BStr>>> {
+    let subsection: &BStr = args.remote_name.as_bytes().into();
+    Ok(git_config.string_by("remote", Some(subsection.into()), key))
 }
 
 pub fn read_config_i64(
     args: &Args,
     key: ConfigKey,
-    git_config: &git2::Config,
+    git_config: &gix_config::File,
 ) -> Result<Option<i64>> {
-    match git_config.get_i64(&format!("remote.{}.{}", &args.remote_name, key)) {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-        Err(e) => Err(e).context(key),
-    }
+    let subsection: &BStr = args.remote_name.as_bytes().into();
+    git_config
+        .integer_by("remote", Some(subsection.into()), key)
+        .transpose()
+        .map_err(Into::into)
 }
 
 pub fn write_config(
     remote_name: &str,
     key: ConfigKey,
-    git_config: &mut git2::Config,
+    git_config: &mut gix_config::File<'static>,
     value: &str,
 ) -> Result<()> {
-    git_config
-        .set_str(&format!("remote.{}.{}", remote_name, key), value)
-        .context(key)
+    let subsection: &BStr = remote_name.as_bytes().into();
+    git_config.set_raw_value_by("remote", Some(subsection.into()), key, value)?;
+    Ok(())
 }
 
 pub fn write_config_i64(
     remote_name: &str,
     key: ConfigKey,
-    git_config: &mut git2::Config,
+    git_config: &mut gix_config::File<'static>,
     value: i64,
 ) -> Result<()> {
+    let subsection: &BStr = remote_name.as_bytes().into();
     git_config
-        .set_i64(&format!("remote.{}.{}", remote_name, key), value)
-        .context(key)
-}
-
-pub fn clean_tracking_config(args: &Args, tracking_config: &mut git2::Config) -> Result<()> {
-    let mut old_tracking_config = Vec::new();
-    {
-        let mut it = tracking_config
-            .entries(Some(&format!("remote.{}.*", &args.remote_name)))
-            .context("list recursion tracking config")?;
-        while let Some(entry) = it.next() {
-            let entry = entry.context("entry")?;
-            let name = entry.name().context("non-utf8 key")?;
-            old_tracking_config.push(name.to_string());
-        }
-    }
-
-    for entry in old_tracking_config {
-        tracking_config
-            .remove(&entry)
-            .context("remove config entry")?;
-    }
-
+        .set_raw_value_by(
+            "remote",
+            Some(subsection.into()),
+            key,
+            value.to_string().as_str(),
+        )
+        .context(key)?;
     Ok(())
 }
 
 pub fn configure_tracking_config(
     args: &Args,
-    user_config: &git2::Config,
-    tracking_config: &mut git2::Config,
+    user_config: &gix_config::File,
+    tracking_config: &mut gix_config::File,
 ) -> Result<()> {
+    let subsection: &BStr = args.remote_name.as_bytes().into();
     tracking_config
-        .set_str(
-            &format!("remote.{}.url", &args.remote_name),
-            &args.remote_url,
+        .set_raw_value_by(
+            "remote",
+            Some(subsection.into()),
+            "url",
+            args.remote_url.as_str(),
         )
         .context("set remote url")?;
 
-    let prefix = format!("remote.{}.recursion-inner-*", &args.remote_name);
-
-    let mut it = user_config
-        .entries(Some(&prefix))
-        .context("list recursion inner config")?;
-    while let Some(entry) = it.next() {
-        let entry = entry.context("entry")?;
-        let name = entry.name().context("non-utf8 key")?;
-        let value = user_config.get_str(&name).context("get config value")?;
-        let s_key = format!(
-            "remote.{}.{}",
-            &args.remote_name,
-            &name[prefix.as_bytes().len() - 1..]
-        );
-        tracking_config
-            .set_str(&s_key, &value)
-            .context("set tracking config")?;
+    const PREFIX: &str = "recursion-inner-";
+    if let Some(sections) = user_config.sections_by_name("remote") {
+        for section in sections {
+            if Some(subsection) == section.header().subsection_name() {
+                for value_name in section.value_names() {
+                    if value_name.starts_with(PREFIX.as_bytes()) {
+                        if let Some(value) = section.value(value_name) {
+                            let inner_name = value_name[PREFIX.len() - 1..].to_string();
+                            tracking_config
+                                .set_raw_value_by(
+                                    "remote",
+                                    Some(subsection.into()),
+                                    inner_name,
+                                    &*value,
+                                )
+                                .context("set tracking config")?;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -555,22 +557,34 @@ pub fn configure_tracking_config(
 pub fn print_key_configuration_guidance(key: ConfigKey) {
     match key {
         ConfigKey::Namespace => {
-            println!("\trecursive-namespace: Each branch on the remote repository can have multiple namespaces, each acting as an upstream for a separate repository. Unset is the same as empty string.");
+            println!(
+                "\trecursive-namespace: Each branch on the remote repository can have multiple namespaces, each acting as an upstream for a separate repository. Unset is the same as empty string."
+            );
         }
         ConfigKey::RemoteBranch => {
-            println!("\trecursive-remote-branch: The branch on the remote repository to use. Defaults to 'main'.");
+            println!(
+                "\trecursive-remote-branch: The branch on the remote repository to use. Defaults to 'main'."
+            );
         }
         ConfigKey::NamespaceNaclKey => {
-            println!("\trecursive-namespace-nacl-key: The encryption key to use to encrypt this repository's contents on the remote.");
+            println!(
+                "\trecursive-namespace-nacl-key: The encryption key to use to encrypt this repository's contents on the remote."
+            );
         }
         ConfigKey::StateNaclKey => {
-            println!("\trecursive-state-nacl-key: The encryption key to use to encrypt the branch metadata. All namespaces (repositories) on the same remote branch must use the same key.");
+            println!(
+                "\trecursive-state-nacl-key: The encryption key to use to encrypt the branch metadata. All namespaces (repositories) on the same remote branch must use the same key."
+            );
         }
         ConfigKey::ShallowBasis => {
-            println!("\trecursive-shallow-basis: Space-separated list of refs that don't need to be stored upstream. This is somewhat analogous to git shallow clone, though it is the upstream that is shallow instead of the local repository. This can be used to synchronize a repository across several machines that share large common history without needing to store the entire history upstream, but any new clones will need to get that common history via another mechanism such as an existing remote.");
+            println!(
+                "\trecursive-shallow-basis: Space-separated list of refs that don't need to be stored upstream. This is somewhat analogous to git shallow clone, though it is the upstream that is shallow instead of the local repository. This can be used to synchronize a repository across several machines that share large common history without needing to store the entire history upstream, but any new clones will need to get that common history via another mechanism such as an existing remote."
+            );
         }
         ConfigKey::MaxObjectSize => {
-            println!("\trecursive-max-object-size: Attempt to split objects stored upstream into chunks around this size.");
+            println!(
+                "\trecursive-max-object-size: Attempt to split objects stored upstream into chunks around this size."
+            );
         }
     }
 }
@@ -608,5 +622,133 @@ pub fn print_configuration_guidance() {
     eprintln!("The following configuration keys are available:");
     for key in ConfigKey::iter() {
         print_key_configuration_guidance(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_args(remote_name: &str) -> (Args, tempfile::TempDir) {
+        let tmp = tempfile::Builder::new()
+            .prefix("config-tests")
+            .tempdir()
+            .expect("tempdir");
+        let base = tmp.path();
+        (
+            Args {
+                user_repo_path: base.join("user"),
+                tracking_repo_path: base.join("tracking"),
+                all_objects_ever_repo_path: base.join("all"),
+                remote_name: remote_name.to_string(),
+                lock_path: base.join("locks"),
+                state_path: base.join("state"),
+                remote_url: "file:///tmp/upstream".to_string(),
+            },
+            tmp,
+        )
+    }
+
+    fn empty_config() -> gix_config::File<'static> {
+        gix_config::File::new(Metadata::default())
+    }
+
+    #[test]
+    fn config_key_short_names_roundtrip() {
+        for key in ConfigKey::iter() {
+            assert_eq!(ConfigKey::from_short_str(key.as_short_str()), Some(key));
+        }
+        assert_eq!(ConfigKey::from_short_str("zzz"), None);
+    }
+
+    #[test]
+    fn configure_remote_branch_defaults_and_normalizes() {
+        let (args, _tmp) = test_args("origin");
+        let subsection: &BStr = args.remote_name.as_bytes().into();
+
+        let config = empty_config();
+        assert_eq!(
+            configure_remote_branch(&args, &config).expect("default"),
+            "refs/heads/main"
+        );
+
+        let mut config = empty_config();
+        config
+            .set_raw_value_by("remote", Some(subsection), ConfigKey::RemoteBranch, "dev")
+            .expect("set branch");
+        assert_eq!(
+            configure_remote_branch(&args, &config).expect("normalize"),
+            "refs/heads/dev"
+        );
+
+        let mut config = empty_config();
+        config
+            .set_raw_value_by(
+                "remote",
+                Some(subsection),
+                ConfigKey::RemoteBranch,
+                "refs/heads/topic",
+            )
+            .expect("set branch");
+        assert_eq!(
+            configure_remote_branch(&args, &config).expect("keep full ref"),
+            "refs/heads/topic"
+        );
+    }
+
+    #[test]
+    fn configure_nacl_key_file_creates_and_reuses() {
+        let tmp = tempfile::Builder::new()
+            .prefix("config-tests")
+            .tempdir()
+            .expect("tempdir");
+        let key_path = tmp.path().join("nacl.key");
+        let key_path = key_path.to_string_lossy().to_string();
+
+        let first = configure_nacl_key_file(&key_path)
+            .expect("first load")
+            .expect("some key");
+        let second = configure_nacl_key_file(&key_path)
+            .expect("second load")
+            .expect("some key");
+
+        assert_eq!(first.serialize_to_string(), second.serialize_to_string());
+    }
+
+    #[test]
+    fn write_and_read_config_i64_roundtrip() {
+        let (args, _tmp) = test_args("origin");
+        let mut config = empty_config();
+
+        write_config_i64(
+            &args.remote_name,
+            ConfigKey::MaxObjectSize,
+            &mut config,
+            12345,
+        )
+        .expect("write");
+        let read = read_config_i64(&args, ConfigKey::MaxObjectSize, &config).expect("read");
+
+        assert_eq!(read, Some(12345));
+    }
+
+    #[test]
+    fn configure_nacl_rejects_invalid_inline_key() {
+        let (args, _tmp) = test_args("origin");
+        let subsection: &BStr = args.remote_name.as_bytes().into();
+        let mut config = empty_config();
+        config
+            .set_raw_value_by(
+                "remote",
+                Some(subsection),
+                ConfigKey::NamespaceNaclKey,
+                "definitely-not-an-eseb-key",
+            )
+            .expect("set invalid key");
+
+        match configure_nacl(ConfigKey::NamespaceNaclKey, &args, &mut config) {
+            Ok(_) => panic!("expected invalid key parse to fail"),
+            Err(err) => assert!(format!("{err}").contains("parse key")),
+        }
     }
 }

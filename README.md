@@ -3,21 +3,23 @@
 Use a git branch as an (encrypted) upstream for git repos.
 
 # Features
-* Stores multiple repositories in a single branch of the upstream repository.
-  * Each has its own objects and refs.
-  * (Optionally) has a separate encryption key.
-* Uses a SHA256 Merkle tree to incrementally update encrypted data.
-* Each upstream branch may be clear, or symmetrically encrypted using [NaCl](http://nacl.cr.yp.to/).
-* Does not rewrite history (on the upstream repository), making it compatible with branch protection.
-* Shallow basis allows synchronizing large repositories without storing all common objects upstream.
+
+- Stores multiple repositories in a single branch of the upstream repository.
+  - Each has its own objects and refs.
+  - (Optionally) has a separate encryption key.
+- Uses a SHA256 Merkle tree to incrementally update encrypted data.
+- Each upstream branch may be clear, or symmetrically encrypted using [NaCl](http://nacl.cr.yp.to/).
+- Does not rewrite history (on the upstream repository), making it compatible with branch protection.
+- Shallow basis allows synchronizing large repositories without storing all common objects upstream.
 
 # Limitations
-* Only supports Linux.
-* Uses ~triple the storage space (Two repositories tracking the upstream in `.git/recursive_remote`).
-* Relies on sys crates: Relies on OpenSSL sys crate via [git2](https://docs.rs/git2/latest/git2/). This can make the build more brittle especially on certain platforms.
-* Relies on shelling out to git to determine whether `--force` is required when pushing. This implicitly makes many assumptions about the platform and the command-line behavior of git.
-* No automatic garbage collection. Objects stored upstream are never removed.
-* Fetching from the remote fetches all objects added since the last fetch, not just those needed.
+
+- Only supports Linux.
+- Uses ~triple the storage space (Two repositories tracking the upstream in `.git/recursive_remote`).
+- Relies on sys crates: Relies on OpenSSL sys crate via [git2](https://docs.rs/git2/latest/git2/). This can make the build more brittle especially on certain platforms.
+- Push force requirements are implemented in-process as an approximation of `git push` semantics, so there is some risk of divergence from git behavior in edge cases.
+- No automatic garbage collection. Objects stored upstream are never removed.
+- Fetching from the remote fetches all objects added since the last fetch, not just those needed.
 
 # Comparison to [gcrypt](https://www.agwa.name/projects/git-crypt)
 | Feature                      | Recursive Remote                                    | Gcrypt                      |
@@ -47,9 +49,9 @@ Gcrypt is a simple shell script that you can just drop in your path and run.
 Recursive Remote is a Rust binary that must be compiled, and depends indirectly
 on OpenSSL, which can make it frustrating to build on some platforms.
 
-Recursive Remote relies on two copies of upstream, one for resolving push
-semantics and one to track upstream. These can be deleted at any time, but will
-be recreated on next use.
+Recursive Remote relies on two local repositories in `.git/recursive_remote`:
+one for tracking upstream state and one for object reachability/pack history.
+These can be deleted at any time, but will be recreated on next use.
 
 Gcrypt relies on GnuPG, which in my experience is brittle to script, and tends
 to rely on per-user keyrings stored centrally[^1]. Recursive Remote uses NaCL
@@ -80,24 +82,31 @@ since I rely on the encryption as an additional layer of protection on top
 private repositories.
 
 My main motivation for writing this was:
-* The force push semantics, which has caused me/collaborators to clobber each others changes unexpectedly several times.
-* Poor performance even on modest repositories.
-* Annoyance of dealing with GPG with many repositories + per-repo keys.
-* Storing multiple entire repos within a single branch.
+
+- The force push semantics, which has caused me/collaborators to clobber each others changes unexpectedly several times.
+- Poor performance even on modest repositories.
+- Annoyance of dealing with GPG with many repositories + per-repo keys.
+- Storing multiple entire repos within a single branch.
 
 # Push semantics
 
 Ideally, the semantics of push would be identical to git for when force is
 required. Git uses a combination of whether it's fast forward and the ref/object
-type (see `man git-push` for details) I don't see an easy way to replicate that
-using libgit that doesn't involve re-implementing it. Instead, we create a
-"push_semantics_repo" to mimic the upstream, shell out to git, and see whether
-or not it can push each ref without force. We then require the user to specify
-force if git did.
+type (see `man git-push` for details). Recursive Remote now checks this
+in-process using the object graph in `all_objects_ever_repo`, without creating a
+secondary repository or shelling out (as it did previously).
 
-An alternative would be for me to attempt to implement the same behavior as git.
-My main concern is that it may change. OTOH the status quo is complex and
-brittle.
+Current behavior without force:
+
+- Existing `refs/tags/*` may not be updated.
+- Existing refs are only updated if both old and new targets are commits and
+  the update is fast-forward.
+- Symbolic ref updates are rejected.
+
+This is intentionally conservative and should match common git workflows, but
+it is an approximation rather than an exact copy of git's rules. In particular,
+it is at risk of becoming stale, especially because it will not take git config
+into account if that changes how this works in the future.
 
 # Ratcheting
 
@@ -156,27 +165,28 @@ git remote add origin recursive::git@github.com:username/org.git
 ```
 
 All configuration is done through Git's config system. The following configuration keys are available:
-* `recursive-namespace`: Each branch on the remote repository can have multiple namespaces, each acting as an upstream for a separate repository. Unset is the same as empty string, aka "default namespace".
-* `recursive-remote-branch`: The branch on the remote repository to use. Defaults to 'main'.
-* `recursive-namespace-nacl-key`: The encryption key to use to encrypt this repository's contents on the remote.
-* `recursive-state-nacl-key`: The encryption key to use to encrypt the branch metadata. All namespaces (repositories) on the same remote branch must use the same key.
-* `recursive-shallow-basis`: Space-separated list of refs that don't need to be stored upstream. This is somewhat analogous to git shallow clone, though it is the upstream that is shallow instead of the local repository. This can be used to synchronize a repository across several machines that share large common history without needing to store the entire history upstream, but any new clones will need to get that common history via another mechanism such as an existing remote.
-* `recursive-max-object-size`: Attempt to split objects stored upstream into chunks around this size.
+
+- `recursive-namespace`: Each branch on the remote repository can have multiple namespaces, each acting as an upstream for a separate repository. Unset is the same as empty string, aka "default namespace".
+- `recursive-remote-branch`: The branch on the remote repository to use. Defaults to 'main'.
+- `recursive-namespace-nacl-key`: The encryption key to use to encrypt this repository's contents on the remote.
+- `recursive-state-nacl-key`: The encryption key to use to encrypt the branch metadata. All namespaces (repositories) on the same remote branch must use the same key.
+- `recursive-shallow-basis`: Space-separated list of refs that don't need to be stored upstream. This is somewhat analogous to git shallow clone, though it is the upstream that is shallow instead of the local repository. This can be used to synchronize a repository across several machines that share large common history without needing to store the entire history upstream, but any new clones will need to get that common history via another mechanism such as an existing remote.
+- `recursive-max-object-size`: Attempt to split objects stored upstream into chunks around this size.
 
 ## Encryption
 
-* Encryption keys use [eseb](https://github.com/calmofthestorm/eseb), a thin wrapper around NaCl. They look similar to "eseb0::sym::jpjvT1mCbu3Am+m4F6SA2cGeY/ja6H+sAuK4Wy+zW/M=::31064"[^2].
-* Each upstream branch is either completely unencrypted or encrypted.
-* Repositories stored on an encrypted upstream branch:
-  * Must specify the same `recursive-state-nacl-key`.
-  * Must specify a value for `recursive-namespace-nacl-key`.
-  * May use the same key as another repository, or `recursive-state-nacl-key`, for `recursive-namespace-nacl-key`.
-* Setting any encryption key to the empty string, or a file that does not exist, will cause a random key to be generated and stored in the config/the specified file on first use.
-* Encryption keys may be stored in a file with 'file://path/to/file'.
-  * If the file does not exist, a random key will be generated and written to that path.
-  * This is convenient if you want to commit the keys in the repository so that any clone can access the encrypted remote.
-  * Keys may be generated explicitly using [eseb](https://github.com/calmofthestorm/eseb), or implicitly by pointing to a non-existent file or setting them to the empty string.
-  
+- Encryption keys use [eseb](https://github.com/calmofthestorm/eseb), a thin wrapper around NaCl. They look similar to "eseb0::sym::jpjvT1mCbu3Am+m4F6SA2cGeY/ja6H+sAuK4Wy+zW/M=::31064"[^2].
+- Each upstream branch is either completely unencrypted or encrypted.
+- Repositories stored on an encrypted upstream branch:
+  - Must specify the same `recursive-state-nacl-key`.
+  - Must specify a value for `recursive-namespace-nacl-key`.
+  - May use the same key as another repository, or `recursive-state-nacl-key`, for `recursive-namespace-nacl-key`.
+- Setting any encryption key to the empty string, or a file that does not exist, will cause a random key to be generated and stored in the config/the specified file on first use.
+- Encryption keys may be stored in a file with 'file://path/to/file'.
+  - If the file does not exist, a random key will be generated and written to that path.
+  - This is convenient if you want to commit the keys in the repository so that any clone can access the encrypted remote.
+  - Keys may be generated explicitly using [eseb](https://github.com/calmofthestorm/eseb), or implicitly by pointing to a non-existent file or setting them to the empty string.
+
 ## Examples
 
 ### Default namespace, generate encryption keys on first use:
@@ -217,15 +227,15 @@ All configuration is done through Git's config system. The following configurati
 
 # Known Issues
 
-* The tracking repo fetches all branches from upstream, rather than just the one the current namespace is on. This is easy to fix, we just need to set the fetchspec properly.
+- The tracking repo fetches all branches from upstream, rather than just the one the current namespace is on. This is easy to fix, we just need to set the fetchspec properly.
 
 # Implementation details
 
 ## Repository format
 
-* Each branch on the upstream (backing) repository is completely independent. Recursive Remote operates on one branch at a time.
-* Recursive Remote adds new commits to it, with the previous commit as parent, and does not force push.
-* Recursive Remote does not assume it has exclusive access to the repository, and relies on git to prevent races on update.
+- Each branch on the upstream (backing) repository is completely independent. Recursive Remote operates on one branch at a time.
+- Recursive Remote adds new commits to it, with the previous commit as parent, and does not force push.
+- Recursive Remote does not assume it has exclusive access to the repository, and relies on git to prevent races on update.
 
 ## Commit/tree format
 
@@ -288,29 +298,28 @@ recover a basis ref).
 
 # (Possible) future work
 
-* Use thin packs. Because we already guarantee all objects on the sender are
+- Use thin packs. Because we already guarantee all objects on the sender are
   present, this will be safe. This would help a lot with the size of incremental
   updates to large files.
-* Improve automated test coverage.
-  * Push semantics -- ensure non-ff in user repo are rejected.
-  * Race condition when updating tracking repo.
-  * Ratcheting.
-  * Shallow basis.
-  * Multiple namespaces on one branch.
-    * Various combinations of same/shared encryption key.
-* Extends feature for pack lists, to avoid namespace.bincode size being
+- Improve automated test coverage.
+  - Push semantics -- ensure non-ff in user repo are rejected.
+  - Race condition when updating tracking repo.
+  - Ratcheting.
+  - Shallow basis.
+  - Multiple namespaces on one branch.
+    - Various combinations of same/shared encryption key.
+- Extends feature for pack lists, to avoid namespace.bincode size being
   quadratic in commit count (since each pack must be mentioned in each commit).
   Alternatively, use the history instead of explicit extends.
-* Basic read-only Git annex support, allowing a large repo to skip storing a few large packs in upstream.
-* Replace shelling out for push semantics. Just implement what the git manual says it does or something.
+- Basic read-only Git annex support, allowing a large repo to skip storing a few large packs in upstream.
 
 # Bugs/Errata
 
-* History traversal depends on being able to access the parent state.bincode
+- History traversal depends on being able to access the parent state.bincode
   going arbitrarily far back. We need to either keep that referenced or make it
   unnecessary. An alternative would be to fall back to re-inserting all packs if
   we ever encounter a broken link during the commit graph traversal.
-* I may have found a bug where we can't fetch after pruning. Possibly the commit
+- I may have found a bug where we can't fetch after pruning. Possibly the commit
   graph traversal algorithm is broken (aka, it's not safe to assume that we can
   terminate traversal at any commit where we have all refs and declare all its
   packs unnecessary)? It is also possible this specific case wase related to
@@ -319,7 +328,7 @@ recover a basis ref).
 
 # Footnotes
 
-[^1]: It is possible to use per-repository keys with Gcrypt:
+\[^1\]: It is possible to use per-repository keys with Gcrypt:
 
 ```
 gpg --homedir .gnupg --full-gen-key
@@ -328,15 +337,15 @@ git config gcrypt.participants $KEY
 git config gcrypt.gpg-args "--homedir .gnupg"
 ```
 
-[^2]: This example key is intentionally invalid to prevent accidental use.
+\[^2\]: This example key is intentionally invalid to prevent accidental use.
 
-[^3]: We decide what to send to the server using `git pack-objects --revs`. This
-    built-in command traverses the commit graph starting at all revs being
-    pushed, and terminating at any rev we know to be present on the remote, or
-    that is explicitly marked as a basis via the `recursive-shallow-basis`
-    config option. Thus, marking a rev as basis just pretends it exists on the
-    remote.
+\[^3\]: We decide what to send to the server using `git pack-objects --revs`. This
+built-in command traverses the commit graph starting at all revs being
+pushed, and terminating at any rev we know to be present on the remote, or
+that is explicitly marked as a basis via the `recursive-shallow-basis`
+config option. Thus, marking a rev as basis just pretends it exists on the
+remote.
 
-[^4]: I suppose some kind of UI could be added to require the user to specify
-    both SHA1 and SHA256 on the initial pull, but trust-on-first-use is good
-    enough for my threat model.
+\[^4\]: I suppose some kind of UI could be added to require the user to specify
+both SHA1 and SHA256 on the initial pull, but trust-on-first-use is good
+enough for my threat model.

@@ -66,76 +66,80 @@ pub fn acquire_flock(lockfile: &Path) -> Result<file_lock::FileLock> {
     .with_context(|| format!("acquire_flock {}", lockfile.display()))
 }
 
+pub fn rr_signature() -> gix_actor::Signature {
+    gix_actor::Signature {
+        name: "Recursive Remote Default".into(),
+        email: "recursive-remote@example.com".into(),
+        time: gix_date::Time::now_local_or_utc(),
+    }
+}
+
 pub fn anyhow_ref_commit(
-    repo: &git2::Repository,
+    repo: &gix::Repository,
     ref_name: &str,
     msg: &str,
-    tree: &git2::Tree,
-) -> anyhow::Result<git2::Oid> {
+    tree: gix::ObjectId,
+) -> anyhow::Result<gix_hash::ObjectId> {
     log::trace!("Commit to ref {:?}", ref_name);
-    let st = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("");
-    let time = git2::Time::new(st.as_secs() as i64, 0);
-    let sig = git2::Signature::new(
-        "Recursive Remote Default",
-        "recursive-remote@example.com",
-        &time,
-    )
-    .expect("");
-    if let Ok(pid) = repo
-        .refname_to_id(ref_name)
-        .with_context(|| format!("failed to lookup refname {} to oid", &ref_name))
+    let sig = rr_signature();
+    let mut committer_time = gix_date::parse::TimeBuf::default();
+    let mut author_time = gix_date::parse::TimeBuf::default();
+    let x = match repo
+        .try_find_reference(ref_name)
+        .with_context(|| format!("failed to lookup refname {} to oid", &ref_name))?
     {
-        repo.commit(
-            Some(ref_name),
-            &sig,
-            &sig,
-            &msg,
-            tree,
-            &[&repo
-                .find_commit(pid)
-                .with_context(|| format!("failed to find commit {:?}", &pid))?],
-        )
-    } else {
-        repo.commit(Some(ref_name), &sig, &sig, &msg, tree, &[])
+        Some(mut r) => {
+            let pid = r.peel_to_id()?.detach();
+            log::trace!("Committing to {} with one parent {}", ref_name, pid);
+            repo.commit_as(
+                sig.to_ref(&mut committer_time),
+                sig.to_ref(&mut author_time),
+                ref_name,
+                msg,
+                tree,
+                [pid].iter().copied(),
+            )
+        }
+        None => {
+            log::trace!("Committing to {} with zero parents", ref_name);
+            let parents: &[gix::ObjectId; 0] = &[];
+            repo.commit_as(
+                sig.to_ref(&mut committer_time),
+                sig.to_ref(&mut author_time),
+                ref_name,
+                msg,
+                tree,
+                parents.iter().copied(),
+            )
+        }
     }
-    .with_context(|| format!("failed to commit tree {} to ref {}", &tree.id(), &ref_name))
+    .with_context(|| format!("failed to commit tree {} to ref {}", &tree, &ref_name))
+    .map(Into::into);
+    x
 }
 
 pub fn peel_reference_to_commit<'a>(
-    repo: &'a git2::Repository,
+    repo: &'a gix::Repository,
     ref_name: &str,
-) -> anyhow::Result<Option<git2::Commit<'a>>> {
-    match repo.resolve_reference_from_short_name(ref_name) {
-        Ok(r) => {
-            let resolved = r
-                .resolve()
+) -> anyhow::Result<Option<gix::Commit<'a>>> {
+    match repo.try_find_reference(ref_name)? {
+        Some(mut r) => {
+            let commit_oid = r
+                .peel_to_id()
                 .with_context(|| format!("Failed to resolve reference {}", &ref_name))?;
-            let commit_oid = resolved.target().with_context(|| {
-                format!(
-                    "Reference {} resolved target does not have an oid.",
-                    &ref_name
-                )
-            })?;
             let commit = repo
-                .find_commit(commit_oid)
+                .find_commit(commit_oid.detach())
                 .with_context(|| format!("Unable to find commit {:?}", &commit_oid))?;
             Ok(Some(commit))
         }
-        Err(e) => {
-            if e.code() != git2::ErrorCode::NotFound {
-                return Err(e).with_context(|| format!("Unable to find reference {}", &ref_name));
-            }
-            Ok(None)
-        }
+        None => Ok(None),
     }
 }
 
-pub fn open_create_bare_repository(path: &Path) -> anyhow::Result<git2::Repository> {
-    match git2::Repository::open_bare(&path) {
+pub fn open_create_bare_repository(path: &Path) -> anyhow::Result<gix::Repository> {
+    match gix::open(&path) {
         Ok(r) => Ok(r),
-        Err(_) => git2::Repository::init_bare(&path)
+        Err(_) => gix::init_bare(&path)
             .with_context(|| format!("failed to init bare repository in {}", path.display())),
     }
 }

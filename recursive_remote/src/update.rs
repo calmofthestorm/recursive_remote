@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use git2::Oid;
+use gix_hash::ObjectId;
 use log::trace;
 use record_reader::HashError;
 use thiserror::Error;
@@ -31,8 +31,8 @@ pub fn update_branches(
     Option<StateRef>,
     State,
     Option<StateRef>,
-    Option<Oid>,
-    Option<Oid>,
+    Option<ObjectId>,
+    Option<ObjectId>,
 )> {
     log::trace!("Fetching pushing branch from underlying remote.");
     update_pushing_branch(config).context("pushing tracking branch")?;
@@ -46,7 +46,7 @@ fn update_pushing_branch(config: &Config) -> Result<()> {
         // Delete the local branch before proceeding. We do this so that if
         // there is no upstream branch we start clean.
         let tracking_repo = config.tracking_repo()?;
-        if let Ok(mut r) = tracking_repo.find_reference(&config.pushing_ref) {
+        if let Ok(r) = tracking_repo.find_reference(&config.pushing_ref) {
             r.delete().context("delete reference")?;
         };
     }
@@ -95,10 +95,10 @@ fn update_pushing_branch(config: &Config) -> Result<()> {
 }
 
 pub fn resolve_state_ref(
-    tracking_repo: &Rc<git2::Repository>,
+    tracking_repo: &Rc<gix::Repository>,
     keys: &EncryptionKeys,
     name: &str,
-) -> Result<Option<(Oid, (StateRef, State), Oid)>> {
+) -> Result<Option<(ObjectId, (StateRef, State), ObjectId)>> {
     Ok(match ref_to_state_oid(&tracking_repo, name)? {
         Some((commit_oid, root_oid, tree_oid)) => Some((
             commit_oid,
@@ -120,8 +120,8 @@ fn update_tracking_branch(
     Option<StateRef>,
     State,
     Option<StateRef>,
-    Option<Oid>,
-    Option<Oid>,
+    Option<ObjectId>,
+    Option<ObjectId>,
 )> {
     let tracking_repo = Rc::new(config.tracking_repo()?);
 
@@ -130,7 +130,7 @@ fn update_tracking_branch(
     let cur_oid = resolve(&config.tracking_ref).context("get state oid for tracking ref")?;
     let fut_oid = resolve(&config.pushing_ref).context("get state oid for pushing ref")?;
     let bas_oid = resolve(&config.basis_ref).context("get state oid for basis ref")?;
-    let bas_oid = bas_oid.map(|bas| bas.1 .0);
+    let bas_oid = bas_oid.map(|bas| bas.1.0);
 
     if let (Some(cur), Some(fut)) = (cur_oid.as_ref(), fut_oid.as_ref()) {
         if !valid_path_exists(config, &tracking_repo, &(cur.1).0, &(fut.1).0)? {
@@ -142,9 +142,9 @@ fn update_tracking_branch(
         Some((commit_oid, future, root_oid)) => {
             tracking_repo
                 .reference(
-                    &config.tracking_ref,
+                    config.tracking_ref.as_str(),
                     commit_oid,
-                    /*force=*/ true,
+                    gix_ref::transaction::PreviousValue::Any,
                     "Recursive",
                 )
                 .context("update tracking ref")?;
@@ -157,7 +157,7 @@ fn update_tracking_branch(
             ))
         }
         None => {
-            if let Ok(mut r) = tracking_repo.find_reference(&config.tracking_ref) {
+            if let Ok(r) = tracking_repo.find_reference(&config.tracking_ref) {
                 r.delete().context("delete tracking reference")?;
             };
             Ok((None, State::default(), bas_oid, None, None))
@@ -172,7 +172,7 @@ fn update_tracking_branch(
 // If we can reach `current_ident` from `future_ident`, accept it.
 fn valid_path_exists(
     config: &Config,
-    tracking_repo: &Rc<git2::Repository>,
+    tracking_repo: &Rc<gix::Repository>,
     current: &StateRef,
     future: &StateRef,
 ) -> Result<bool> {
@@ -205,4 +205,147 @@ fn valid_path_exists(
     log::warn!("Failed to find a path back.");
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use super::*;
+    use crate::encoding::encode_state;
+    use crate::serialization::{BlobRef, NamespaceRef, ResourceKey};
+
+    fn make_config(base: &Path) -> Config {
+        Config {
+            namespace: "ns".to_string(),
+            user_repo_path: base.join("user"),
+            tracking_repo_path: base.join("tracking"),
+            remote_name: "origin".to_string(),
+            tracking_ref: "refs/heads/origin/tracking".to_string(),
+            all_objects_ever_repo_path: base.join("all"),
+            state_path: base.join("state"),
+            lock_path: base.join("locks"),
+            pushing_ref: "refs/heads/origin/push".to_string(),
+            basis_ref: "refs/heads/origin/basis".to_string(),
+            remote_url: "file:///tmp/upstream".to_string(),
+            remote_ref: "refs/heads/main".to_string(),
+            nacl_keys: EncryptionKeys { inner: None },
+            shallow_basis: Vec::new(),
+            max_object_size: 64,
+        }
+    }
+
+    #[test]
+    fn valid_path_exists_true_for_identical_refs() {
+        let tmp = tempfile::Builder::new()
+            .prefix("update-tests")
+            .tempdir()
+            .expect("tempdir");
+        let tracking_repo = Rc::new(gix::init_bare(tmp.path().join("tracking")).expect("repo"));
+        let config = make_config(tmp.path());
+
+        let sref = StateRef(BlobRef {
+            resource_key: ResourceKey::Git(Vec::new()),
+            sha256: [1; 32],
+        });
+
+        let ok =
+            valid_path_exists(&config, &tracking_repo, &sref, &sref).expect("path check result");
+        assert!(ok);
+    }
+
+    #[test]
+    fn valid_path_exists_true_when_current_is_parent() {
+        let tmp = tempfile::Builder::new()
+            .prefix("update-tests")
+            .tempdir()
+            .expect("tempdir");
+        let tracking_repo = Rc::new(gix::init_bare(tmp.path().join("tracking")).expect("repo"));
+        let config = make_config(tmp.path());
+
+        let current_state = State::default();
+        let current = StateRef(
+            encode_state(
+                &tracking_repo,
+                &current_state,
+                &config.nacl_keys,
+                config.max_object_size,
+            )
+            .expect("encode current"),
+        );
+
+        let future_state = State {
+            namespaces: HashMap::new(),
+            parents: vec![current.clone()],
+        };
+        let future = StateRef(
+            encode_state(
+                &tracking_repo,
+                &future_state,
+                &config.nacl_keys,
+                config.max_object_size,
+            )
+            .expect("encode future"),
+        );
+
+        let ok = valid_path_exists(&config, &tracking_repo, &current, &future).expect("path");
+        assert!(ok);
+    }
+
+    #[test]
+    fn valid_path_exists_false_for_unrelated_states() {
+        let tmp = tempfile::Builder::new()
+            .prefix("update-tests")
+            .tempdir()
+            .expect("tempdir");
+        let tracking_repo = Rc::new(gix::init_bare(tmp.path().join("tracking")).expect("repo"));
+        let config = make_config(tmp.path());
+
+        let current = StateRef(
+            encode_state(
+                &tracking_repo,
+                &State::default(),
+                &config.nacl_keys,
+                config.max_object_size,
+            )
+            .expect("encode current"),
+        );
+
+        let unrelated = State {
+            namespaces: HashMap::from([(
+                "other".to_string(),
+                NamespaceRef(BlobRef {
+                    resource_key: ResourceKey::Git(Vec::new()),
+                    sha256: [9; 32],
+                }),
+            )]),
+            parents: Vec::new(),
+        };
+        let future = StateRef(
+            encode_state(
+                &tracking_repo,
+                &unrelated,
+                &config.nacl_keys,
+                config.max_object_size,
+            )
+            .expect("encode unrelated"),
+        );
+
+        let ok = valid_path_exists(&config, &tracking_repo, &current, &future).expect("path");
+        assert!(!ok);
+    }
+
+    #[test]
+    fn resolve_state_ref_returns_none_for_missing_ref() {
+        let tmp = tempfile::Builder::new()
+            .prefix("update-tests")
+            .tempdir()
+            .expect("tempdir");
+        let tracking_repo = Rc::new(gix::init_bare(tmp.path().join("tracking")).expect("repo"));
+        let keys = EncryptionKeys { inner: None };
+        let out =
+            resolve_state_ref(&tracking_repo, &keys, "refs/heads/does-not-exist").expect("resolve");
+        assert!(out.is_none());
+    }
 }

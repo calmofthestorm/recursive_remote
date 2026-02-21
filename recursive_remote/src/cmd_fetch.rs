@@ -4,7 +4,7 @@ use std::io::BufRead;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use git2::Repository;
+use gix::Repository;
 
 use crate::config::*;
 use crate::encoding::*;
@@ -45,7 +45,7 @@ pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
     // we do have a per-remote lock.
     delete_refs_glob(
         &config.user_repo()?,
-        &format!("refs/recursive_remote/{}/tmp/*", &config.remote_name),
+        &format!("refs/recursive_remote/{}/tmp/", &config.remote_name),
     )?;
 
     // Fix the thin packs, and insert their objects into the all objects repo.
@@ -61,14 +61,7 @@ pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
     // This is per-remote since our exclusive locking is.
     let all_objects_ever_repo = config.all_objects_ever_repo()?;
 
-    let mut fetch_revs = HashSet::new();
-    for rev in revs {
-        if rev.starts_with("fetch ") {
-            let rev = &rev["fetch ".len()..];
-            let rev = &rev[..40];
-            fetch_revs.insert(rev);
-        }
-    }
+    let fetch_revs = parse_fetch_revs(revs);
 
     if !fetch_revs.is_empty() {
         let mut cmd = crate::util::git_command();
@@ -81,9 +74,9 @@ pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
         for rev in fetch_revs {
             all_objects_ever_repo
                 .reference(
-                    &format!("refs/heads/{}/rev{}", &config.remote_name, &rev),
-                    git2::Oid::from_str(rev).context("oid")?,
-                    /*force=*/ true,
+                    format!("refs/heads/{}/rev{}", &config.remote_name, &rev),
+                    gix_hash::ObjectId::from_hex(rev.as_bytes()).context("oid")?,
+                    gix_ref::transaction::PreviousValue::Any,
                     "Recursive",
                 )
                 .with_context(|| format!("create ref in all_objects_ever_repo -> {}", &rev))?;
@@ -101,9 +94,9 @@ pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
         config
             .tracking_repo()?
             .reference(
-                &config.basis_ref,
+                config.basis_ref.as_str(),
                 commit_id,
-                /*force=*/ true,
+                gix_ref::transaction::PreviousValue::Any,
                 "Recursive",
             )
             .context("update basis ref")?;
@@ -119,7 +112,7 @@ pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
 
 pub fn materialize_ordered_pack_list(
     config: &Config,
-    tracking_repo: &Rc<git2::Repository>,
+    tracking_repo: &Rc<gix::Repository>,
     state_identifier: Option<&StateRef>,
     state: &State,
     basis_ref: Option<&StateRef>,
@@ -165,40 +158,70 @@ pub fn materialize_ordered_pack_list(
     Ok(ordered_packs)
 }
 
-fn compact_ref_reachability(repo: &git2::Repository, remote_name: &str) -> Result<()> {
+fn compact_ref_reachability(repo: &gix::Repository, remote_name: &str) -> Result<()> {
     let mut ref_commits = Vec::default();
-    let mut ref_names = Vec::default();
-    for r in repo.references_glob(&format!("refs/heads/{}/*", remote_name))? {
-        let r = r?;
-        if let Some(name) = r.name() {
-            ref_commits.push(r.peel_to_commit()?);
-            ref_names.push(name.to_string());
+    let mut ref_names: Vec<String> = Vec::default();
+    let prefix = format!("refs/heads/{}", remote_name);
+    for mut r in repo.references()?.prefixed(prefix.as_str())? {
+        match r {
+            Err(e) => {
+                anyhow::bail!(format!("error: {}", &e));
+            }
+            Ok(ref mut r) => {
+                ref_commits.push(r.peel_to_commit()?.id);
+                ref_names.push(r.name().as_bstr().to_string());
+            }
         }
     }
     if ref_commits.len() > 50 {
-        let tree = repo.treebuilder(None)?.write()?;
-        let tree = repo.find_tree(tree)?;
-        let sig = repo.signature()?;
-        let parents: Vec<_> = ref_commits.iter().collect();
-        let rev = repo.commit(None, &sig, &sig, "Recursive", &tree, &parents)?;
-        repo.reference(
-            &format!("refs/heads/{}/rev{rev}", remote_name),
-            rev,
-            /*force=*/ true,
+        let uuidv4 = uuid::Uuid::new_v4();
+        let tree = repo.empty_tree().edit()?.write()?;
+        let sig = rr_signature();
+        let mut committer_time = gix_date::parse::TimeBuf::default();
+        let mut author_time = gix_date::parse::TimeBuf::default();
+        repo.commit_as(
+            sig.to_ref(&mut committer_time),
+            sig.to_ref(&mut author_time),
+            format!("refs/heads/{}/rev{uuidv4}", remote_name),
             "Recursive",
-        )
-        .context("update tracking ref")?;
+            tree,
+            ref_commits,
+        )?;
         for rev in ref_names.iter() {
-            repo.find_reference(&rev)?.delete()?;
+            repo.find_reference(rev)?.delete()?;
         }
     }
     Ok(())
 }
 
-pub fn delete_refs_glob(repo: &git2::Repository, glob: &str) -> Result<()> {
-    for reference in repo.references_glob(glob)? {
-        let mut reference = reference?;
-        reference.delete()?;
+fn parse_fetch_revs(revs: &[String]) -> HashSet<String> {
+    let mut fetch_revs = HashSet::new();
+    for rev in revs {
+        let mut tok = rev.split_ascii_whitespace();
+        if tok.next() != Some("fetch") {
+            continue;
+        }
+        let Some(oidish) = tok.next() else {
+            continue;
+        };
+        let end = std::cmp::min(40, oidish.len());
+        if end > 0 {
+            fetch_revs.insert(oidish[..end].to_string());
+        }
+    }
+    fetch_revs
+}
+
+pub fn delete_refs_glob(repo: &gix::Repository, glob: &str) -> Result<()> {
+    // gix no longer accepts wildcard components here; treat '*' suffix as legacy syntax.
+    let prefix = glob.trim_end_matches('*');
+    for reference in repo.references()?.prefixed(prefix)? {
+        match reference {
+            Ok(reference) => {
+                reference.delete()?;
+            }
+            Err(e) => anyhow::bail!("bad error: {}", &e),
+        }
     }
     Ok(())
 }
@@ -259,4 +282,104 @@ pub fn fetch_pack(
     }
 
     anyhow::bail!("no pack was written");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_repo() -> (tempfile::TempDir, gix::Repository, gix_hash::ObjectId) {
+        let tmp = tempfile::Builder::new()
+            .prefix("cmd-fetch-tests")
+            .tempdir()
+            .expect("tempdir");
+        let repo = gix::init_bare(tmp.path().join("repo")).expect("init bare repo");
+        let tree = repo
+            .empty_tree()
+            .edit()
+            .expect("edit")
+            .write()
+            .expect("write tree");
+        let commit =
+            anyhow_ref_commit(&repo, "refs/heads/main", "Recursive.", tree.into()).expect("commit");
+        (tmp, repo, commit)
+    }
+
+    fn count_prefixed_refs(repo: &gix::Repository, prefix: &str) -> usize {
+        repo.references()
+            .expect("refs")
+            .prefixed(prefix)
+            .expect("prefixed")
+            .count()
+    }
+
+    #[test]
+    fn parse_fetch_revs_ignores_non_fetch_and_handles_short_hashes() {
+        let revs = vec![
+            "capabilities".to_string(),
+            "fetch abcdef".to_string(),
+            "fetch 0123456789012345678901234567890123456789 refs/heads/main".to_string(),
+            "fetch".to_string(),
+        ];
+        let parsed = parse_fetch_revs(&revs);
+        assert!(parsed.contains("abcdef"));
+        assert!(parsed.contains("0123456789012345678901234567890123456789"));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn delete_refs_glob_deletes_only_matching_prefix() {
+        let (_tmp, repo, commit) = setup_repo();
+        repo.reference(
+            "refs/recursive_remote/origin/tmp/tmp1",
+            commit,
+            gix_ref::transaction::PreviousValue::Any,
+            "Recursive",
+        )
+        .expect("tmp1");
+        repo.reference(
+            "refs/recursive_remote/origin/tmp/tmp2",
+            commit,
+            gix_ref::transaction::PreviousValue::Any,
+            "Recursive",
+        )
+        .expect("tmp2");
+        repo.reference(
+            "refs/recursive_remote/origin/keep/me",
+            commit,
+            gix_ref::transaction::PreviousValue::Any,
+            "Recursive",
+        )
+        .expect("keep");
+
+        delete_refs_glob(&repo, "refs/recursive_remote/origin/tmp/*").expect("delete");
+
+        assert_eq!(
+            count_prefixed_refs(&repo, "refs/recursive_remote/origin/tmp/"),
+            0
+        );
+        assert_eq!(
+            count_prefixed_refs(&repo, "refs/recursive_remote/origin/keep/"),
+            1
+        );
+    }
+
+    #[test]
+    fn compact_ref_reachability_compacts_when_many_refs() {
+        let (_tmp, repo, commit) = setup_repo();
+        for i in 0..51 {
+            repo.reference(
+                format!("refs/heads/origin/rev{i:02}"),
+                commit,
+                gix_ref::transaction::PreviousValue::Any,
+                "Recursive",
+            )
+            .expect("reference");
+        }
+        assert_eq!(count_prefixed_refs(&repo, "refs/heads/origin"), 51);
+
+        compact_ref_reachability(&repo, "origin").expect("compact");
+
+        assert_eq!(count_prefixed_refs(&repo, "refs/heads/origin"), 1);
+    }
 }

@@ -3,14 +3,14 @@ use std::convert::TryInto;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
-use git2::Oid;
+use gix_hash::ObjectId;
 use rand::Rng;
 
 use crate::config::EncryptionKeys;
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum ResourceKey {
-    Git(Vec<Oid>),
+    Git(Vec<ObjectId>),
     Annex(String),
 }
 
@@ -65,11 +65,11 @@ struct SerializedNamespaceRef(SerializedBlobRef);
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Ref {
-    Direct(Oid),
+    Direct(ObjectId),
 
     // Save the oid at the time so that we can use this to track reachability
     // later.
-    Symbolic(String, Option<Oid>),
+    Symbolic(String, Option<ObjectId>),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -113,7 +113,7 @@ pub struct SerializedState {
 
 impl Namespace {
     pub fn new() -> Namespace {
-        let random_name: [u8; 20] = rand::thread_rng().gen();
+        let random_name: [u8; 20] = rand::thread_rng().r#gen();
         Namespace {
             refs: HashMap::new(),
             pack: None,
@@ -206,7 +206,7 @@ impl std::convert::TryFrom<&SerializedResourceKey> for ResourceKey {
                 let mut oids = Vec::with_capacity(s_oids.len() / 20);
                 if !s_oids.is_empty() {
                     for oid in s_oids.chunks_exact(20) {
-                        oids.push(Oid::from_bytes(oid).expect("valid"));
+                        oids.push(ObjectId::from_bytes_or_panic(oid));
                     }
                 }
                 ResourceKey::Git(oids)
@@ -232,7 +232,7 @@ impl std::convert::From<&ResourceKey> for SerializedResourceKey {
 }
 
 impl BlobRef {
-    pub fn oids(&self) -> &[Oid] {
+    pub fn oids(&self) -> &[ObjectId] {
         match &self.resource_key {
             ResourceKey::Git(oids) => oids,
             _ => &[],
@@ -326,28 +326,35 @@ impl std::convert::TryFrom<SerializedRef> for Ref {
 
     fn try_from(r: SerializedRef) -> Result<Ref> {
         Ok(match r {
-            SerializedRef::Direct(s) => Ref::Direct(Oid::from_bytes(&s)?),
+            SerializedRef::Direct(s) => Ref::Direct(ObjectId::from_bytes_or_panic(&s)),
             SerializedRef::Symbolic(s, d) => {
-                Ref::Symbolic(s, d.map(|d| Oid::from_bytes(&d)).transpose()?)
+                Ref::Symbolic(s, d.map(|d| ObjectId::from_bytes_or_panic(&d)))
             }
         })
     }
 }
 
 impl Ref {
-    pub fn new(user_repo: &git2::Repository, target: &str) -> Result<Ref> {
-        let reference = user_repo
-            .resolve_reference_from_short_name(&target)
-            .context("find reference")?;
+    pub fn new(user_repo: &gix::Repository, target: &str) -> Result<Ref> {
+        let mut reference = user_repo.find_reference(target).context("find reference")?;
         match reference.target() {
-            Some(target) => Ok(Ref::Direct(target)),
-            None => {
-                let symbolic = reference
-                    .symbolic_target()
-                    .context("Neither symbolic nor nonsymbolic.")?;
+            gix_ref::TargetRef::Object(target) => Ok(Ref::Direct(target.into())),
+            gix_ref::TargetRef::Symbolic(symbolic) => {
+                let symbolic = symbolic.as_bstr().to_string();
 
-                let target = reference.resolve().ok().and_then(|r| r.target());
-                Ok(Ref::Symbolic(symbolic.to_string(), target))
+                // We will still store invalid references, but obviously we can't store their deps.
+                let target = match reference.peel_to_id() {
+                    Ok(target) => Some(target),
+                    Err(e) => {
+                        log::warn!(
+                            "Unable to peel symbolic reference {} to id: {}. We will store the reference as is.",
+                            target,
+                            &e
+                        );
+                        None
+                    }
+                };
+                Ok(Ref::Symbolic(symbolic, target.map(Into::into)))
             }
         }
     }
@@ -360,7 +367,7 @@ impl Ref {
         }
     }
 
-    pub fn oid_at_time(&self) -> Option<Oid> {
+    pub fn oid_at_time(&self) -> Option<ObjectId> {
         match self {
             Ref::Direct(b) => Some(*b),
             Ref::Symbolic(_, b) => *b,
@@ -369,7 +376,7 @@ impl Ref {
 
     pub fn to_git_wire_string(&self) -> String {
         match self {
-            Ref::Direct(b) => hex::encode(b),
+            Ref::Direct(b) => b.to_string(),
             Ref::Symbolic(s, _) => s.clone(),
         }
     }
@@ -406,7 +413,7 @@ impl State {
         &self,
         namespace: &str,
         keys: &EncryptionKeys,
-        tracking_repo: &Rc<git2::Repository>,
+        tracking_repo: &Rc<gix::Repository>,
     ) -> Result<Option<Namespace>> {
         match self.namespaces.get(namespace) {
             Some(namespace_ref) => Ok(Some(
@@ -466,5 +473,111 @@ impl std::convert::From<&Namespace> for SerializedNamespace {
             pack: r.pack.as_ref().map(Into::into),
             random_name: r.random_name,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oid(hex: &str) -> ObjectId {
+        ObjectId::from_hex(hex.as_bytes()).expect("valid oid")
+    }
+
+    #[test]
+    fn resource_key_git_roundtrip() {
+        let key = ResourceKey::Git(vec![
+            oid("1111111111111111111111111111111111111111"),
+            oid("2222222222222222222222222222222222222222"),
+        ]);
+        let serialized: SerializedResourceKey = (&key).into();
+        let decoded = ResourceKey::try_from(&serialized).expect("decode");
+        assert_eq!(key, decoded);
+    }
+
+    #[test]
+    fn resource_key_git_rejects_invalid_length() {
+        let serialized = SerializedResourceKey::Git(vec![1, 2, 3]);
+        let err = ResourceKey::try_from(&serialized).expect_err("must fail");
+        assert!(format!("{err}").contains("20 bytes each"));
+    }
+
+    #[test]
+    fn namespace_conversion_roundtrip() {
+        let pack = PackRef {
+            blob_ref: BlobRef {
+                resource_key: ResourceKey::Git(vec![oid(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )]),
+                sha256: [7; 32],
+            },
+            random_name: [3; 20],
+        };
+
+        let mut refs = HashMap::new();
+        refs.insert(
+            "refs/heads/main".to_string(),
+            Ref::Direct(oid("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+        );
+        refs.insert(
+            "HEAD".to_string(),
+            Ref::Symbolic(
+                "refs/heads/main".to_string(),
+                Some(oid("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+            ),
+        );
+
+        let namespace = Namespace {
+            refs,
+            pack: Some(pack),
+            random_name: [9; 20],
+        };
+
+        let serialized: SerializedNamespace = (&namespace).into();
+        let decoded = Namespace::try_from(&serialized).expect("decode namespace");
+        assert!(namespace == decoded);
+    }
+
+    #[test]
+    fn state_serialization_sorts_parents() {
+        let mk_parent = |byte| {
+            StateRef(BlobRef {
+                resource_key: ResourceKey::Git(vec![oid(
+                    "cccccccccccccccccccccccccccccccccccccccc",
+                )]),
+                sha256: [byte; 32],
+            })
+        };
+        let low = mk_parent(1);
+        let high = mk_parent(200);
+
+        let state = State {
+            namespaces: HashMap::new(),
+            parents: vec![high.clone(), low.clone()],
+        };
+
+        let serialized: SerializedState = (&state).into();
+        let decoded = State::try_from(&serialized).expect("decode state");
+
+        assert_eq!(decoded.parents, vec![low, high]);
+    }
+
+    #[test]
+    fn ref_helpers_behave_as_expected() {
+        let direct = Ref::Direct(oid("dddddddddddddddddddddddddddddddddddddddd"));
+        let symbolic = Ref::Symbolic(
+            "refs/heads/main".to_string(),
+            Some(oid("dddddddddddddddddddddddddddddddddddddddd")),
+        );
+        let symbolic_other = Ref::Symbolic("refs/heads/dev".to_string(), None);
+
+        assert!(Ref::shallow_equal(&direct, &direct));
+        assert!(Ref::shallow_equal(&symbolic, &symbolic));
+        assert!(!Ref::shallow_equal(&symbolic, &symbolic_other));
+        assert_eq!(
+            symbolic.oid_at_time(),
+            Some(oid("dddddddddddddddddddddddddddddddddddddddd"))
+        );
+        assert_eq!(symbolic.to_git_wire_string(), "refs/heads/main");
     }
 }

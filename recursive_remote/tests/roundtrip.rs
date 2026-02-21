@@ -1,97 +1,86 @@
 extern crate recursive_remote;
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use assert_cmd::prelude::*;
 use eseb::KeyMaterial;
+use gix::diff::object::bstr::BStr;
+use predicates::prelude::*;
 use recursive_remote::config::{ConfigKey, EncryptionKeys, EncryptionKeysInner};
 
-// FIXME: Share with non-test code.
-fn debug_stream_message<S: Read>(stream: Option<S>, sn: &'static str) -> Result<String> {
-    match stream {
-        Some(mut s) => {
-            let mut st = Vec::default();
-            s.read_to_end(&mut st).context("read").context(sn)?;
-            match std::str::from_utf8(&st) {
-                Ok(m) => Ok(m.to_string()),
-                Err(_) => Ok(format!("<utf error> {:?}", &st)),
-            }
-        }
-        None => Ok(format!("<no {}>", sn)),
-    }
-}
-
-// FIXME: Share with non-test code.
-pub fn execute_subprocess2(
-    command: &mut std::process::Command,
-) -> anyhow::Result<std::process::Output> {
-    let output = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()?;
-
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(anyhow::Error::msg(format!(
-            "subprocess failed.\n---STDOUT---\n{}\n\n---STDERR---\n\n{}\n",
-            debug_stream_message(Some(output.stdout.as_slice()), "stdout")?,
-            debug_stream_message(Some(output.stderr.as_slice()), "stderr")?,
-        )))
-    }
-}
-
 fn git(bin_dir: &Path) -> std::process::Command {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut combined_path = OsString::from(bin_dir.as_os_str());
+    combined_path.push(":");
+    combined_path.push(path);
+
     let mut c = std::process::Command::new("git");
-    c.env_clear()
-        .env("PATH", bin_dir)
+    c.env("PATH", combined_path)
         .env("GIT_COMMITTER_EMAIL", "you@example.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_AUTHOR_EMAIL", "you@example.com")
-        .env("GIT_AUTHOR_NAME", "Test User");
+        .env("GIT_AUTHOR_NAME", "Test User")
+        .arg("-c")
+        .arg("init.defaultBranch=main");
     c
 }
 
-fn set_config(flavor: &Flavor, config: &mut git2::Config, keys: &EncryptionKeys) {
-    let keygen = |key| format!("remote.{}.{}", flavor.remote_name(), key);
+fn set_config(flavor: &Flavor, config: &mut gix_config::File<'static>, keys: &EncryptionKeys) {
+    let subsection = flavor.remote_name();
+    let subsection: &BStr = subsection.as_bytes().into();
 
     config
-        .set_i64(&keygen(ConfigKey::MaxObjectSize.as_ref()), 30)
+        .set_raw_value_by("remote", Some(subsection), ConfigKey::MaxObjectSize, "30")
         .unwrap();
     config
-        .set_str(
-            &keygen(ConfigKey::RemoteBranch.as_ref()),
+        .set_raw_value_by(
+            "remote",
+            Some(subsection),
+            ConfigKey::RemoteBranch,
             flavor.branch_name(),
         )
         .unwrap();
 
     if let Some(key) = keys.namespace_key() {
         config
-            .set_str(
-                &keygen(ConfigKey::NamespaceNaclKey.as_ref()),
-                &key.serialize_to_string(),
+            .set_raw_value_by(
+                "remote",
+                Some(subsection),
+                ConfigKey::NamespaceNaclKey,
+                key.serialize_to_string().as_str(),
             )
             .unwrap();
     }
 
     if let Some(key) = keys.state_key() {
         config
-            .set_str(
-                &keygen(ConfigKey::StateNaclKey.as_ref()),
-                &key.serialize_to_string(),
+            .set_raw_value_by(
+                "remote",
+                Some(subsection),
+                ConfigKey::StateNaclKey,
+                key.serialize_to_string().as_str(),
             )
             .unwrap();
     }
 }
 
-fn set_common_config(flavor: &Flavor, config: &mut git2::Config, url: &str) {
-    let keygen = |key| format!("remote.{}.{}", flavor.remote_name(), key);
-
-    config.set_str(&keygen("url"), &url).unwrap();
+fn set_common_config(flavor: &Flavor, config: &mut gix_config::File, url: &str) {
+    let subsection = flavor.remote_name();
+    let subsection: &BStr = subsection.as_bytes().into();
 
     config
-        .set_str(&keygen("fetch"), "+refs/heads/*:refs/remotes/origin/*")
+        .set_raw_value_by("remote", Some(subsection), "url", url)
+        .unwrap();
+
+    config
+        .set_raw_value_by(
+            "remote",
+            Some(subsection),
+            "fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        )
         .unwrap();
 }
 
@@ -132,234 +121,286 @@ impl Flavor {
 }
 
 #[test]
-fn roundtrip_cleartext_embed() {
-    roundtrip(
-        &Flavor::Plain,
-        /*do_conflict=*/ false,
-        /*embed_config=*/ true,
-    );
+fn roundtrip_cleartext_embed_initial_sync() {
+    scenario_initial_sync(&Flavor::Plain, true);
 }
 
 #[test]
-fn roundtrip_cleartext_conflict_embed() {
-    roundtrip(
-        &Flavor::Plain,
-        /*do_conflict=*/ true,
-        /*embed_config=*/ true,
-    );
+fn roundtrip_crypttext_embed_initial_sync() {
+    scenario_initial_sync(&Flavor::Encrypted, true);
 }
 
 #[test]
-fn roundtrip_crypttext_embed() {
-    roundtrip(
-        &Flavor::Encrypted,
-        /*do_conflict=*/ false,
-        /*embed_config=*/ true,
-    );
+fn roundtrip_cleartext_initial_sync() {
+    scenario_initial_sync(&Flavor::Plain, false);
 }
 
 #[test]
-fn roundtrip_crypttext_conflict_embed() {
-    roundtrip(
-        &Flavor::Encrypted,
-        /*do_conflict=*/ true,
-        /*embed_config=*/ true,
-    );
+fn roundtrip_crypttext_initial_sync() {
+    scenario_initial_sync(&Flavor::Encrypted, false);
 }
 
 #[test]
-fn roundtrip_cleartext() {
-    roundtrip(
-        &Flavor::Plain,
-        /*do_conflict=*/ false,
-        /*embed_config=*/ false,
-    );
+fn roundtrip_cleartext_embed_conflict_rejected() {
+    scenario_conflict_rejected(&Flavor::Plain, true);
 }
 
 #[test]
-fn roundtrip_cleartext_conflict() {
-    roundtrip(
-        &Flavor::Plain,
-        /*do_conflict=*/ true,
-        /*embed_config=*/ false,
-    );
+fn roundtrip_crypttext_embed_conflict_rejected() {
+    scenario_conflict_rejected(&Flavor::Encrypted, true);
 }
 
 #[test]
-fn roundtrip_crypttext() {
-    roundtrip(
-        &Flavor::Encrypted,
-        /*do_conflict=*/ false,
-        /*embed_config=*/ false,
-    );
+fn roundtrip_cleartext_conflict_rejected() {
+    scenario_conflict_rejected(&Flavor::Plain, false);
 }
 
 #[test]
-fn roundtrip_crypttext_conflict() {
-    roundtrip(
-        &Flavor::Encrypted,
-        /*do_conflict=*/ true,
-        /*embed_config=*/ false,
-    );
+fn roundtrip_crypttext_conflict_rejected() {
+    scenario_conflict_rejected(&Flavor::Encrypted, false);
 }
 
-fn roundtrip(flavor: &Flavor, do_conflict: bool, embed_config: bool) {
-    let td = tempdir::TempDir::new("rust-test").unwrap();
-    let bin_dir = td.path().join("bin");
+#[test]
+fn roundtrip_cleartext_merge_roundtrip() {
+    scenario_merge_roundtrip(&Flavor::Plain, false);
+}
 
-    // This is an integration test that actually runs git, which is then
-    // dependent on finding a compiled binary. This tries to set that up, but is
-    // brittle.
-    get_binary(&bin_dir);
+#[test]
+fn roundtrip_crypttext_merge_roundtrip() {
+    scenario_merge_roundtrip(&Flavor::Encrypted, false);
+}
 
-    let user_repo1 = git2::Repository::init(&td.path().join("user_repo1")).unwrap();
-    let user_repo2 = git2::Repository::init(&td.path().join("user_repo2")).unwrap();
-    let workdir1 = &user_repo1.workdir().unwrap();
-    let workdir2 = &user_repo2.workdir().unwrap();
-    let upstream_repo = git2::Repository::init_bare(&td.path().join("upstream_repo")).unwrap();
+#[test]
+fn roundtrip_cleartext_churn() {
+    scenario_churn(&Flavor::Plain, false);
+}
 
-    let keys = flavor.gen_keys();
+#[test]
+fn roundtrip_crypttext_churn() {
+    scenario_churn(&Flavor::Encrypted, false);
+}
 
-    let upstream = upstream_repo.path().to_string_lossy();
-    let url = if embed_config {
-        format!("file://{}", upstream)
-    } else {
-        format!("recursive::file://{}", upstream)
-    };
+struct ScenarioHarness {
+    _tempdir: assert_fs::TempDir,
+    bin_dir: PathBuf,
+    workdir1: PathBuf,
+    workdir2: PathBuf,
+    remote_name: &'static str,
+}
 
-    let set_rr_config = |config| {
-        set_config(flavor, config, &keys);
-    };
+impl ScenarioHarness {
+    fn new(flavor: &Flavor, embed_config: bool) -> ScenarioHarness {
+        let tempdir = assert_fs::TempDir::new().unwrap();
+        let tmp_path = tempdir.path();
+        let bin_dir = tmp_path.join("bin");
 
-    let url = if embed_config {
-        let path = td.path().join("embed");
-        let mut config = git2::Config::open(&path).unwrap();
-        set_rr_config(&mut config);
-        let embedded = recursive_remote::embedded_config::embed_file(&path).unwrap();
-        assert_eq!(embedded.len(), 1);
-        let embedded = embedded.into_values().next().unwrap().0;
-        format!("recursive::{}:{}", &embedded, &url)
-    } else {
-        let mut config1 = user_repo1.config().unwrap();
-        let mut config2 = user_repo2.config().unwrap();
-        set_rr_config(&mut config1);
-        set_rr_config(&mut config2);
-        url
-    };
+        // This is an integration test that actually runs git, which is then
+        // dependent on finding a compiled binary. This tries to set that up, but is
+        // brittle.
+        get_binary(&bin_dir);
 
-    let mut config1 = user_repo1.config().unwrap();
-    let mut config2 = user_repo2.config().unwrap();
-    set_common_config(flavor, &mut config1, &url);
-    set_common_config(flavor, &mut config2, &url);
+        let mut user_repo1 = gix::init(&tmp_path.join("user_repo1")).unwrap();
+        let mut user_repo2 = gix::init(&tmp_path.join("user_repo2")).unwrap();
+        let workdir1 = user_repo1.workdir().unwrap().to_owned();
+        let workdir2 = user_repo2.workdir().unwrap().to_owned();
+        let upstream_repo = gix::init_bare(&tmp_path.join("upstream_repo")).unwrap();
 
-    pretty_print(
-        git(&bin_dir)
-            .current_dir(&workdir1)
-            .arg("branch")
-            .arg("-m")
-            .arg("main"),
-    );
+        let keys = flavor.gen_keys();
 
-    pretty_print(
-        git(&bin_dir)
-            .current_dir(&workdir2)
-            .arg("branch")
-            .arg("-m")
-            .arg("main"),
-    );
+        let upstream = upstream_repo.path().to_string_lossy();
+        let base_url = if embed_config {
+            format!("file://{}", upstream)
+        } else {
+            format!("recursive::file://{}", upstream)
+        };
 
-    let commit_file_contents = |n, workdir: &Path, contents: &str| {
-        let name = format!("file{}", n);
-        let f1_path = workdir.join(&name);
+        let url = if embed_config {
+            let path = tmp_path.join("embed");
+            let mut config = gix_config::File::new(gix_config::file::Metadata::default());
+            set_config(flavor, &mut config, &keys);
+            config
+                .write_to(&mut std::fs::File::create(&path).unwrap())
+                .unwrap();
+            let embedded = recursive_remote::embedded_config::embed_file(&path).unwrap();
+            assert_eq!(embedded.len(), 1);
+            let embedded = embedded.into_values().next().unwrap().0;
+            format!("recursive::{}:{}", &embedded, &base_url)
+        } else {
+            let mut config1 = user_repo1.config_snapshot_mut();
+            let mut config2 = user_repo2.config_snapshot_mut();
+            set_config(flavor, &mut config1, &keys);
+            set_config(flavor, &mut config2, &keys);
+            base_url
+        };
 
-        std::fs::File::create(&f1_path)
-            .unwrap()
-            .write_all(contents.as_bytes())
-            .unwrap();
+        let config_path_1 = user_repo1.path().join("config");
+        let config_path_2 = user_repo2.path().join("config");
 
-        execute_subprocess2(git(&bin_dir).current_dir(&workdir).arg("add").arg(&name))
-            .expect("git add");
+        {
+            let mut config1 = user_repo1.config_snapshot_mut();
+            let mut config2 = user_repo2.config_snapshot_mut();
+            set_common_config(flavor, &mut config1, &url);
+            set_common_config(flavor, &mut config2, &url);
 
-        execute_subprocess2(
-            git(&bin_dir)
-                .current_dir(&workdir)
-                .arg("commit")
-                .arg("-m")
-                .arg(&format!("commit file{}", n)),
-        )
-        .expect("git commit");
-    };
-
-    let content = |n| format!("hello hello hello hello hello hello {}", n);
-    let commit_file = |n, workdir: &Path| commit_file_contents(n, workdir, &content(n));
-
-    commit_file(1, &workdir1);
-    commit_file(2, &workdir1);
-    commit_file(3, &workdir1);
-
-    // Push commits from repo1 to upstream, thence to repo2.
-    push_through(flavor.remote_name(), &bin_dir, &workdir1, &workdir2);
-
-    // Verify one of the files.
-    read_file(&workdir2, "file2", &content(2));
-
-    // Commit a new file on the second repo.
-    commit_file(4, &workdir2);
-
-    push_through(flavor.remote_name(), &bin_dir, &workdir2, &workdir1);
-
-    // Read the file created in repo2 in repo1.
-    read_file(&workdir1, "file4", &content(4));
-
-    // Commit some files on both.
-    commit_file(5, &workdir2);
-    commit_file(6, &workdir2);
-    commit_file(7, &workdir2);
-    commit_file(8, &workdir1);
-
-    // Do a round trip, which should trigger a merge.
-    push_through(flavor.remote_name(), &bin_dir, &workdir1, &workdir2);
-    push_through(flavor.remote_name(), &bin_dir, &workdir2, &workdir1);
-
-    // Verify the merge worked.
-    read_file(&workdir1, "file7", &content(7));
-    read_file(&workdir2, "file7", &content(7));
-    read_file(&workdir1, "file8", &content(8));
-    read_file(&workdir2, "file8", &content(8));
-
-    if do_conflict {
-        // Create a conflict on the upstream.
-        commit_file_contents(9, &workdir1, "from");
-        commit_file_contents(9, &workdir2, "to");
+            config1
+                .write_to(&mut std::fs::File::create(&config_path_1).unwrap())
+                .unwrap();
+            config2
+                .write_to(&mut std::fs::File::create(&config_path_2).unwrap())
+                .unwrap();
+        }
 
         pretty_print(
             git(&bin_dir)
                 .current_dir(&workdir1)
+                .arg("branch")
+                .arg("-m")
+                .arg("main"),
+        );
+
+        pretty_print(
+            git(&bin_dir)
+                .current_dir(&workdir2)
+                .arg("branch")
+                .arg("-m")
+                .arg("main"),
+        );
+
+        ScenarioHarness {
+            _tempdir: tempdir,
+            bin_dir,
+            workdir1,
+            workdir2,
+            remote_name: flavor.remote_name(),
+        }
+    }
+
+    fn content(n: usize) -> String {
+        format!("hello hello hello hello hello hello {}", n)
+    }
+
+    fn commit_file_contents(&self, n: usize, workdir: &Path, contents: &str) {
+        let name = format!("file{}", n);
+        let path = workdir.join(&name);
+
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(contents.as_bytes())
+            .unwrap();
+
+        git(&self.bin_dir)
+            .current_dir(workdir)
+            .arg("add")
+            .arg(&name)
+            .assert()
+            .success();
+
+        git(&self.bin_dir)
+            .current_dir(workdir)
+            .arg("commit")
+            .arg("-m")
+            .arg(&format!("commit file{}", n))
+            .assert()
+            .success();
+    }
+
+    fn commit_file(&self, n: usize, workdir: &Path) {
+        self.commit_file_contents(n, workdir, &Self::content(n));
+    }
+
+    fn push_through(&self, source: &Path, dest: &Path) {
+        push_through(self.remote_name, &self.bin_dir, source, dest);
+    }
+
+    fn assert_file(&self, workdir: &Path, n: usize) {
+        read_file(workdir, &format!("file{}", n), &Self::content(n));
+    }
+
+    fn establish_two_way_sync(&self) {
+        self.commit_file(1, &self.workdir1);
+        self.commit_file(2, &self.workdir1);
+        self.commit_file(3, &self.workdir1);
+
+        self.push_through(&self.workdir1, &self.workdir2);
+        self.assert_file(&self.workdir2, 2);
+
+        self.commit_file(4, &self.workdir2);
+        self.push_through(&self.workdir2, &self.workdir1);
+        self.assert_file(&self.workdir1, 4);
+    }
+
+    fn run_merge_roundtrip(&self) {
+        self.commit_file(5, &self.workdir2);
+        self.commit_file(6, &self.workdir2);
+        self.commit_file(7, &self.workdir2);
+        self.commit_file(8, &self.workdir1);
+
+        self.push_through(&self.workdir1, &self.workdir2);
+        self.push_through(&self.workdir2, &self.workdir1);
+
+        self.assert_file(&self.workdir1, 7);
+        self.assert_file(&self.workdir2, 7);
+        self.assert_file(&self.workdir1, 8);
+        self.assert_file(&self.workdir2, 8);
+    }
+
+    fn run_conflict_rejected(&self) {
+        self.commit_file_contents(9, &self.workdir1, "from");
+        self.commit_file_contents(9, &self.workdir2, "to");
+
+        pretty_print(
+            git(&self.bin_dir)
+                .current_dir(&self.workdir1)
                 .arg("push")
-                .arg(flavor.remote_name())
+                .arg(self.remote_name)
                 .arg("main:main"),
         );
 
-        let conflict = git(&bin_dir)
-            .current_dir(&workdir2)
+        git(&self.bin_dir)
+            .current_dir(&self.workdir2)
             .arg("push")
-            .arg(flavor.remote_name())
+            .arg(self.remote_name)
             .arg("main:main")
-            .output()
-            .unwrap();
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("Updates were rejected because the remote contains work")
+                    .or(predicate::str::contains("failed to push some refs"))
+                    .or(predicate::str::contains("remote rejected"))
+                    .or(predicate::str::contains("rejected")),
+            );
+    }
 
-        assert!(!conflict.status.success());
-
-        let stderr = std::str::from_utf8(&conflict.stderr).unwrap();
-        assert!(stderr.contains("Updates were rejected because the remote contains work"));
-    } else {
-        // Do changes in a loop to catch certain classes of race conditions.
+    fn run_churn(&self) {
         for j in 100..115 {
-            commit_file(j, &workdir1);
-            push_through(flavor.remote_name(), &bin_dir, &workdir1, &workdir2);
-            read_file(&workdir2, &format!("file{}", j), &content(j));
+            self.commit_file(j, &self.workdir1);
+            self.push_through(&self.workdir1, &self.workdir2);
+            self.assert_file(&self.workdir2, j);
         }
     }
+}
+
+fn scenario_initial_sync(flavor: &Flavor, embed_config: bool) {
+    let harness = ScenarioHarness::new(flavor, embed_config);
+    harness.establish_two_way_sync();
+}
+
+fn scenario_conflict_rejected(flavor: &Flavor, embed_config: bool) {
+    let harness = ScenarioHarness::new(flavor, embed_config);
+    harness.establish_two_way_sync();
+    harness.run_conflict_rejected();
+}
+
+fn scenario_merge_roundtrip(flavor: &Flavor, embed_config: bool) {
+    let harness = ScenarioHarness::new(flavor, embed_config);
+    harness.establish_two_way_sync();
+    harness.run_merge_roundtrip();
+}
+
+fn scenario_churn(flavor: &Flavor, embed_config: bool) {
+    let harness = ScenarioHarness::new(flavor, embed_config);
+    harness.establish_two_way_sync();
+    harness.run_churn();
 }
 
 fn read_file(workdir: &Path, name: &str, contents: &str) {
@@ -370,6 +411,11 @@ fn read_file(workdir: &Path, name: &str, contents: &str) {
 }
 
 fn push_through(remote_name: &str, bin_dir: &Path, source: &Path, dest: &Path) {
+    eprintln!(
+        "Push through in dir {} with rn {}",
+        source.display(),
+        remote_name
+    );
     pretty_print(
         git(&bin_dir)
             .current_dir(source)
@@ -388,31 +434,12 @@ fn push_through(remote_name: &str, bin_dir: &Path, source: &Path, dest: &Path) {
 }
 
 fn pretty_print(command: &mut std::process::Command) {
-    let output = command.output().unwrap();
-    if output.status.success() {
-        return;
-    }
-
-    eprintln!("A git command failed. The output is above. Please keep in mind that this is output from recursive_remote that git ran in a subprocess, and also this test ran that git in a subprocess. We have captured the git output and printed it above.");
-
-    std::io::stderr().lock().write_all(&output.stderr).unwrap();
-
-    panic!("A git command failed.");
-}
-
-#[cfg(debug_assertions)]
-fn build_name() -> &'static str {
-    "debug"
-}
-
-#[cfg(not(debug_assertions))]
-fn build_name() -> &'static str {
-    "release"
+    command.assert().success();
 }
 
 fn get_binary(bin_dir: &Path) {
-    let b = PathBuf::from(format!("../target/{}/git-remote-recursive", build_name()));
+    let b = assert_cmd::cargo::cargo_bin!("git-remote-recursive");
     std::fs::create_dir(bin_dir).unwrap();
-    std::fs::copy(&b, bin_dir.join("git-remote-recursive")).expect("For this integration test to pass, you'll need to build the binary and have it be available in relpath ../target/debug|release/git-remote-recursive.");
-    std::fs::copy("/usr/bin/git", bin_dir.join("git")).expect("unable to copy git");
+    std::fs::copy(&b, bin_dir.join("git-remote-recursive"))
+        .expect("copy git-remote-recursive for git helper discovery");
 }

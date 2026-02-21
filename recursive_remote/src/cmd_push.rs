@@ -3,6 +3,7 @@ use std::io::Write;
 use std::rc::Rc;
 
 use anyhow::{Context, Result};
+use gix::diff::object::FindHeader;
 
 use crate::config::*;
 use crate::persistence::*;
@@ -13,6 +14,24 @@ use crate::util::*;
 enum PushResult {
     Ok(HashMap<String, bool>),
     Retry,
+}
+
+fn classify_failed_push_for_retry(
+    previous_state_identifier: &Option<StateRef>,
+    new_state_identifier: &Option<StateRef>,
+    push_error: &anyhow::Error,
+) -> Result<PushResult> {
+    if new_state_identifier != previous_state_identifier {
+        log::info!("Unable to push and upstream has changed from");
+        Ok(PushResult::Retry)
+    } else {
+        None.with_context(|| {
+            format!(
+                "Unable to push and upstream has not changed: {:?}",
+                push_error
+            )
+        })
+    }
 }
 
 fn parse_push_specs(
@@ -38,7 +57,7 @@ fn parse_push_specs(
 }
 
 fn start_pack_process(
-    user_repo: &Rc<git2::Repository>,
+    user_repo: &Rc<gix::Repository>,
     namespace: &Namespace,
     pushes: &HashMap<String, Ref>,
     force_pushes: &HashMap<String, Option<Ref>>,
@@ -69,7 +88,6 @@ fn start_pack_process(
 
     // EXCLUDE revs that are already in the upstream repository and those in the
     // shallow basis.
-    let user_odb = user_repo.odb()?;
     for oid in namespace
         .refs
         .values()
@@ -80,8 +98,11 @@ fn start_pack_process(
         // unusual but not impossible, if the user garbage collected some
         // things or whatnot. Arguably git pack-objects could just ignore
         // them, but it does not.
-        if user_odb.exists(oid) {
-            write!(&mut stdin, "^{}\n", oid).context("write exclude revs to git pack-objects")?;
+        if let Ok(result) = user_repo.objects.try_header(oid.as_ref()) {
+            if result.is_some() {
+                write!(&mut stdin, "^{}\n", oid)
+                    .context("write exclude revs to git pack-objects")?;
+            }
         }
     }
 
@@ -89,7 +110,7 @@ fn start_pack_process(
 }
 
 fn convert_force_specs_to_refs(
-    user_repo: &git2::Repository,
+    user_repo: &gix::Repository,
     specs: &Vec<(String, String)>,
 ) -> Result<HashMap<String, Option<Ref>>> {
     let mut refs = HashMap::new();
@@ -107,7 +128,7 @@ fn convert_force_specs_to_refs(
 }
 
 fn convert_specs_to_refs(
-    user_repo: &git2::Repository,
+    user_repo: &gix::Repository,
     specs: &Vec<(String, String)>,
 ) -> Result<HashMap<String, Ref>> {
     let refs = convert_force_specs_to_refs(user_repo, specs).context("parse")?;
@@ -120,7 +141,7 @@ fn convert_specs_to_refs(
                 None => {
                     return None.context(
                         "logic error -- push deletes should always get lumped in with force",
-                    )
+                    );
                 }
             },
         );
@@ -136,10 +157,10 @@ fn convert_specs_to_refs(
 // still needs a physical one for git).
 fn do_commit(
     namespace_name: &str,
-    tracking_repo: &Rc<git2::Repository>,
+    tracking_repo: &Rc<gix::Repository>,
     local_ref: &str,
     future: &State,
-    root_id: Option<git2::Oid>,
+    root_id: Option<gix_hash::ObjectId>,
     encrypt: &EncryptionKeys,
     max_object_size: usize,
 ) -> Result<()> {
@@ -160,9 +181,10 @@ fn do_commit(
         }
     };
 
-    let root = tracking_repo
-        .treebuilder(root.as_ref())
-        .context("create treebuilder")?;
+    let root = match root {
+        Some(root) => root.edit(),
+        None => tracking_repo.empty_tree().edit(),
+    }?;
 
     let tree = create_commit_tree(
         &tracking_repo,
@@ -174,11 +196,8 @@ fn do_commit(
         max_object_size,
     )
     .context("create commit tree")?;
-    let tree = tracking_repo
-        .find_tree(tree)
-        .context("find commit tree from oid")?;
-    anyhow_ref_commit(tracking_repo, local_ref, "Recursive.", &tree)
-        .with_context(|| format!("failed to commit tree {} to ref {}", &tree.id(), &local_ref))
+    anyhow_ref_commit(tracking_repo, local_ref, "Recursive.", tree)
+        .with_context(|| format!("failed to commit tree {} to ref {}", &tree, &local_ref))
         .map(|_| ())
 }
 
@@ -224,7 +243,12 @@ fn attempt_push(
     {
         let tmp_ref = format!("refs/recursive_remote/{}/tmp/tmp{rev}", &config.remote_name);
         user_repo
-            .reference(&tmp_ref, rev, /*force=*/ true, "Recursive")
+            .reference(
+                tmp_ref.as_str(),
+                rev,
+                gix_ref::transaction::PreviousValue::Any,
+                "Recursive",
+            )
             .with_context(|| format!("create tmp ref in user_repo -> {}", &rev))?;
         cmd.arg(format!(
             "{tmp_ref}:refs/heads/{}/rev{rev}",
@@ -238,7 +262,7 @@ fn attempt_push(
     // we do have a per-remote lock.
     crate::cmd_fetch::delete_refs_glob(
         &user_repo,
-        &format!("refs/recursive_remote/{}/tmp/*", &config.remote_name),
+        &format!("refs/recursive_remote/{}/tmp/", &config.remote_name),
     )?;
 
     let all_objects_ever_repo = Rc::new(config.all_objects_ever_repo()?);
@@ -299,17 +323,11 @@ fn attempt_push(
 
     let (new_state_identifier, _new_state, _basis_state, _root_id, _commit_id) =
         update_branches(config).context("push secondary update")?;
-    if new_state_identifier != state_identifier {
-        log::info!("Unable to push and upstream has changed from");
-        return Ok(PushResult::Retry);
-    }
-
-    None.with_context(|| {
-        format!(
-            "Unable to push and upstream has not changed: {:?}",
-            &push_result.unwrap_err()
-        )
-    })
+    classify_failed_push_for_retry(
+        &state_identifier,
+        &new_state_identifier,
+        &push_result.expect_err("checked is_ok above"),
+    )
 }
 
 pub fn push(config: &Config, specs: &Vec<String>) -> Result<()> {
@@ -340,4 +358,118 @@ pub fn push(config: &Config, specs: &Vec<String>) -> Result<()> {
     }
 
     None.context("After many tries, unable to push due to conflicts in the backing repo.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_state_ref(tag: u8) -> StateRef {
+        StateRef(BlobRef {
+            resource_key: ResourceKey::Annex(format!("annex-{tag}")),
+            sha256: [tag; 32],
+        })
+    }
+
+    fn setup_repo() -> (tempfile::TempDir, gix::Repository) {
+        let tmp = tempfile::Builder::new()
+            .prefix("cmd-push-tests")
+            .tempdir()
+            .expect("tempdir");
+        let repo = gix::init_bare(tmp.path().join("repo")).expect("init bare repo");
+        let tree = repo
+            .empty_tree()
+            .edit()
+            .expect("edit")
+            .write()
+            .expect("write tree");
+        anyhow_ref_commit(&repo, "refs/heads/main", "Recursive.", tree.into()).expect("commit");
+        (tmp, repo)
+    }
+
+    #[test]
+    fn parse_push_specs_rejects_non_push_lines() {
+        let specs = vec!["fetch abc:def".to_string()];
+        let mut pushes = Vec::new();
+        let mut force_pushes = Vec::new();
+        let err = parse_push_specs(&specs, &mut pushes, &mut force_pushes).expect_err("must fail");
+        assert!(format!("{err}").contains("not two tokens or not start with push"));
+    }
+
+    #[test]
+    fn parse_push_specs_rejects_missing_dest() {
+        let specs = vec!["push refs/heads/main".to_string()];
+        let mut pushes = Vec::new();
+        let mut force_pushes = Vec::new();
+        let err = parse_push_specs(&specs, &mut pushes, &mut force_pushes).expect_err("must fail");
+        assert!(format!("{err}").contains("bad push spec dest"));
+    }
+
+    #[test]
+    fn parse_push_specs_splits_force_and_regular_pushes() {
+        let specs = vec![
+            "push refs/heads/main:refs/heads/main".to_string(),
+            "push +refs/tags/v1:refs/tags/v1".to_string(),
+            "push :refs/heads/old".to_string(),
+        ];
+        let mut pushes = Vec::new();
+        let mut force_pushes = Vec::new();
+        parse_push_specs(&specs, &mut pushes, &mut force_pushes).expect("parse");
+
+        assert_eq!(
+            pushes,
+            vec![("refs/heads/main".to_string(), "refs/heads/main".to_string())]
+        );
+        assert_eq!(
+            force_pushes,
+            vec![
+                ("refs/tags/v1".to_string(), "refs/tags/v1".to_string()),
+                ("".to_string(), "refs/heads/old".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn convert_force_specs_to_refs_keeps_deletes_as_none() {
+        let (_tmp, repo) = setup_repo();
+        let specs = vec![
+            ("refs/heads/main".to_string(), "refs/heads/main".to_string()),
+            ("".to_string(), "refs/heads/old".to_string()),
+        ];
+        let refs = convert_force_specs_to_refs(&repo, &specs).expect("convert");
+        assert!(refs.get("refs/heads/main").expect("main").is_some());
+        assert!(refs.get("refs/heads/old").expect("old").is_none());
+    }
+
+    #[test]
+    fn convert_specs_to_refs_rejects_delete_without_force() {
+        let (_tmp, repo) = setup_repo();
+        let specs = vec![("".to_string(), "refs/heads/old".to_string())];
+        let err = convert_specs_to_refs(&repo, &specs).expect_err("must fail");
+        assert!(format!("{err}").contains("push deletes should always get lumped in with force"));
+    }
+
+    #[test]
+    fn classify_failed_push_for_retry_returns_retry_when_state_changes() {
+        let old = Some(fake_state_ref(1));
+        let new = Some(fake_state_ref(2));
+        let err = anyhow::anyhow!("git push failed");
+        let out = classify_failed_push_for_retry(&old, &new, &err).expect("result");
+        match out {
+            PushResult::Retry => {}
+            PushResult::Ok(..) => panic!("expected retry"),
+        }
+    }
+
+    #[test]
+    fn classify_failed_push_for_retry_errors_when_state_unchanged() {
+        let state = fake_state_ref(7);
+        let old = Some(state.clone());
+        let new = Some(state);
+        let err = anyhow::anyhow!("git push failed");
+        let out = classify_failed_push_for_retry(&old, &new, &err)
+            .err()
+            .expect("must fail");
+        assert!(format!("{out}").contains("upstream has not changed"));
+    }
 }

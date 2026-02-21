@@ -1,36 +1,48 @@
 [package]
 name = "recursive_remote"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Alex Roper <alex@aroper.net>"]
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.21"
+assert_cmd = "2.1"
+assert_fs = "1.1"
+base64 = "0.22"
 bincode = "1.3"
-brotli = "3.3"
+brotli = "8.0"
 build_stamp = "1.0"
-byteorder = "1.4"
-chrono = "0.4"
+byteorder = "1.5"
 clap = "3.2"
-env_logger = "0.9"
-eseb = { version = "1.1", git = "https://github.com/calmofthestorm/eseb.git" }
+env_logger = "0.11"
+eseb = { version = "2.0", git = "https://github.com/calmofthestorm/eseb.git" }
 file-lock = "2.1"
-git2 = "0.17"
+gix = { version = "0.79", features = ["tree-editor"] }
+gix-actor = "0.39"
+gix-commitgraph = "0.33"
+gix-config = "0.52"
+gix-date = "0.14"
+gix-hash = "0.22"
+gix-object = "0.56"
+gix-ref = "0.59"
+gix-revision = "0.41"
+gix-sec = "0.13"
 hex = "0.4"
 log = "0.4"
-once_cell = "1.17"
+once_cell = "1.21"
+predicates = "3.1"
 rand = "0.8"
-record_reader = { version = "1.0", git = "https://github.com/calmofthestorm/record_reader.git", features = [] }
-regex = "1.6"
+record_reader = { version = "1.1", git = "https://github.com/calmofthestorm/record_reader.git", features = [] }
+regex = "1.12"
 serde = {version="1.0", features = ["derive"]}
 sha1 = "0.10"
 sha2 = "0.10"
-strum = "0.24"
-strum_macros = "0.24"
-tempdir = "0.3"
+strum = "0.27"
+strum_macros = "0.27"
+tempfile = "3.25"
 thiserror = "1.0"
-walkdir = "2.3"
+uuid = { version = "1.21", features = ["v4"] }
+walkdir = "2.5"
 
 [[bin]]
 name = "git-remote-recursive"

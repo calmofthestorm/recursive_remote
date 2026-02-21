@@ -1,9 +1,12 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use gix::diff::object::bstr::BStr;
+use gix_config::Source;
+use gix_sec::Trust;
 use strum::IntoEnumIterator;
 
 use crate::config::*;
@@ -17,13 +20,12 @@ use crate::config::*;
 #[derive(Default, serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
 struct EmbeddedConfig(HashMap<String, ConfigValue>);
 
-pub fn embed(config: &git2::Config) -> Result<HashMap<String, (String, Option<String>)>> {
+pub fn embed(config: &gix_config::File) -> Result<HashMap<String, (String, Option<String>)>> {
     let mut remotes = HashSet::new();
 
-    let mut entries = config.entries(Some("remote*")).unwrap();
-    while let Some(entry) = entries.next() {
-        if let Ok(Some(name)) = entry.map(|e| e.name()) {
-            if let Some(name) = name.split('.').nth(1) {
+    if let Some(sections) = config.sections_by_name("remote") {
+        for section in sections {
+            if let Some(name) = section.header().subsection_name() {
                 remotes.insert(name.to_string());
             }
         }
@@ -39,33 +41,28 @@ pub fn embed(config: &git2::Config) -> Result<HashMap<String, (String, Option<St
     Ok(embeds)
 }
 
-pub fn embed_remote(config: &git2::Config, remote: &str) -> Result<(String, Option<String>)> {
+pub fn embed_remote(config: &gix_config::File, remote: &str) -> Result<(String, Option<String>)> {
     let mut map = HashMap::new();
+    let subsection: &BStr = remote.as_bytes().into();
 
     for key in ConfigKey::iter() {
-        let remote_key = format!("remote.{}.{}", remote, key);
-        let v = if key.is_i64() {
-            config.get_i64(&remote_key).map(ConfigValue::Int64)
+        if let Some(v) = if key.is_i64() {
+            config
+                .integer_by("remote", Some(subsection.into()), key)
+                .transpose()?
+                .map(ConfigValue::Int64)
         } else {
-            config.get_string(&remote_key).map(ConfigValue::String)
-        };
-
-        match v {
-            Ok(v) => {
-                map.insert(key.as_short_str().to_string(), v);
-            }
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {}
-            Err(e) => return Err(e).context(remote_key),
+            config
+                .string_by("remote", Some(subsection.into()), key)
+                .map(|v| ConfigValue::String(Cow::Owned(v.to_string())))
+        } {
+            map.insert(key.as_short_str().to_string(), v);
         }
     }
 
-    let remote_key = format!("remote.{}.url", remote);
-    let url = match config.get_string(&remote_key) {
-        Ok(url) => Some(url),
-        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
-        Err(e) => return Err(e).context(remote_key),
-    };
-
+    let url = config
+        .string_by("remote", Some(subsection.into()), "url")
+        .map(|s| s.to_string());
     let map = EmbeddedConfig(map);
 
     let mut compressor = brotli::CompressorWriter::new(
@@ -85,12 +82,23 @@ pub fn embed_remote(config: &git2::Config, remote: &str) -> Result<(String, Opti
 }
 
 pub fn embed_file(path: &Path) -> Result<HashMap<String, (String, Option<String>)>> {
-    let config = git2::Config::open(path).context("parse git config file")?;
+    let config = gix_config::File::from_paths_metadata(
+        Some(gix_config::file::Metadata {
+            path: Some(path.into()),
+            source: Source::Api,
+            level: 0,
+            trust: Trust::Full,
+        }),
+        gix_config::file::init::Options::default(),
+    )?
+    .context("parse git config file")?;
     embed(&config).context("embed config")
 }
 
 pub fn parse(embedded: &str, remote_name: &str) -> Result<String> {
-    let tmp = tempdir::TempDir::new("recursive_remote")?;
+    let tmp = tempfile::Builder::new()
+        .prefix("recursive_remote")
+        .tempdir()?;
     let tmp = tmp.path().join("git_config");
     parse_into_file(embedded, remote_name, &tmp)?;
     std::fs::read_to_string(&tmp)
@@ -108,23 +116,33 @@ pub fn parse_into_file(embedded: &str, remote_name: &str, out: &Path) -> Result<
     let map =
         bincode::deserialize_from::<_, EmbeddedConfig>(decompressor).context("deserialize")?;
 
-    let mut config = git2::Config::open(out).context("create empty git config on disk")?;
+    let mut config = gix_config::File::new(gix_config::file::Metadata {
+        path: Some(out.to_path_buf()),
+        source: Source::Local,
+        level: 0,
+        trust: Trust::Full,
+    });
     for (key, value) in map.0.iter() {
         if let Some(key) = ConfigKey::from_short_str(key) {
-            let remote_key = format!("remote.{}.{}", remote_name, &key);
-            match value {
-                ConfigValue::Int64(v) => config.set_i64(&remote_key, *v),
-                ConfigValue::String(v) => config.set_str(&remote_key, v),
-            }
-            .with_context(|| format!("set git config key {} to {}", &remote_key, &value))?;
+            let subsection: &BStr = remote_name.as_bytes().into();
+            let raw_value = match value {
+                ConfigValue::Int64(v) => v.to_string(),
+                ConfigValue::String(v) => v.to_string(),
+            };
+            config.set_raw_value_by("remote", Some(subsection), key, raw_value.as_str())?;
         }
     }
+
+    config.write_to(&mut std::fs::File::create(&out)?)?;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
     use super::*;
 
     const TEXT: &'static str = r#"
@@ -141,7 +159,10 @@ mod tests {
     #[test]
     fn test_embedded_config() {
         let remote_name = "myremote";
-        let tmp = tempdir::TempDir::new("rust-test").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-test")
+            .tempdir()
+            .unwrap();
         let tmp = tmp.path();
         let config_path = tmp.join("git_config");
         let parsed_config_path = tmp.join("parsed_git_config");
@@ -154,52 +175,141 @@ mod tests {
         let parsed = parse(&embedded, remote_name).unwrap();
         std::fs::write(&parsed_config_path, &parsed).unwrap();
 
-        let config = git2::Config::open(&parsed_config_path).unwrap();
+        let config = gix_config::File::from_paths_metadata(
+            Some(gix_config::file::Metadata {
+                path: Some(parsed_config_path.into()),
+                source: Source::Api,
+                level: 0,
+                trust: Trust::Full,
+            }),
+            gix_config::file::init::Options::default(),
+        )
+        .unwrap()
+        .unwrap();
 
-        let keygen = |key| format!("remote.{}.{}", remote_name, &key);
+        let subsection: &BStr = remote_name.as_bytes().into();
 
         assert_eq!(
-            config.get_i64(&keygen(ConfigKey::MaxObjectSize)).unwrap(),
+            config
+                .integer_by("remote", Some(subsection), ConfigKey::MaxObjectSize)
+                .unwrap()
+                .unwrap(),
             1048576
         );
         assert_eq!(
-            config.get_string(&keygen(ConfigKey::Namespace)).unwrap(),
+            *config
+                .string_by("remote", Some(subsection), ConfigKey::Namespace)
+                .unwrap(),
             "foo"
         );
         assert_eq!(
-            config.get_string(&keygen(ConfigKey::RemoteBranch)).unwrap(),
+            *config
+                .string_by("remote", Some(subsection), ConfigKey::RemoteBranch)
+                .unwrap(),
             "bar-baz"
         );
     }
 
     #[test]
     fn test_git_overrides() {
-        let tmp = tempdir::TempDir::new("rust-test").unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-test")
+            .tempdir()
+            .unwrap();
         let tmp = tmp.path();
         let config1_path = tmp.join("git_config1");
         let config2_path = tmp.join("git_config2");
 
         {
-            let mut config = git2::Config::open(&config1_path).unwrap();
-            config.set_str("remote.foo", "bees").unwrap();
-            config.set_str("remote.bar", "wasps").unwrap();
+            let mut config = gix_config::File::new(gix_config::file::Metadata {
+                path: Some(config1_path.clone().into()),
+                source: Source::Api,
+                level: 0,
+                trust: Trust::Full,
+            });
+
+            config.set_raw_value(&"remote.foo", "bees").unwrap();
+            config.set_raw_value(&"remote.bar", "wasps").unwrap();
+
+            config
+                .write_to(&mut std::fs::File::create(&config1_path).unwrap())
+                .unwrap();
         }
 
         {
-            let mut config = git2::Config::open(&config2_path).unwrap();
-            config.set_str("remote.qux", "hornets").unwrap();
-            config.set_str("remote.bar", "fire ants").unwrap();
+            let mut config = gix_config::File::new(gix_config::file::Metadata {
+                path: Some(config2_path.clone().into()),
+                source: Source::Api,
+                level: 0,
+                trust: Trust::Full,
+            });
+
+            config.set_raw_value(&"remote.qux", "hornets").unwrap();
+            config.set_raw_value(&"remote.bar", "fire ants").unwrap();
+
+            config
+                .write_to(&mut std::fs::File::create(&config2_path).unwrap())
+                .unwrap();
         }
 
-        let mut config = git2::Config::new().unwrap();
-        config
-            .add_file(&config1_path, git2::ConfigLevel::Local, true)
+        let config = gix_config::File::from_paths_metadata(
+            [
+                gix_config::file::Metadata {
+                    path: Some(config1_path),
+                    source: Source::Local,
+                    level: 0,
+                    trust: Trust::Full,
+                },
+                gix_config::file::Metadata {
+                    path: Some(config2_path),
+                    source: Source::Api,
+                    level: 0,
+                    trust: Trust::Full,
+                },
+            ]
+            .iter()
+            .cloned(),
+            gix_config::file::init::Options::default(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!("bees", *config.string("remote.foo").unwrap());
+        assert_eq!("fire ants", *config.string("remote.bar").unwrap());
+        assert_eq!("hornets", *config.string("remote.qux").unwrap());
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_version() {
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-test")
+            .tempdir()
             .unwrap();
-        config
-            .add_file(&config2_path, git2::ConfigLevel::App, true)
+        let out = tmp.path().join("git_config");
+        let err = parse_into_file("1abc", "origin", &out).expect_err("must fail");
+        assert!(format!("{err}").contains("unknown version or invalid"));
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_base64() {
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-test")
+            .tempdir()
             .unwrap();
-        assert_eq!("bees", &config.get_string("remote.foo").unwrap());
-        assert_eq!("fire ants", &config.get_string("remote.bar").unwrap());
-        assert_eq!("hornets", &config.get_string("remote.qux").unwrap());
+        let out = tmp.path().join("git_config");
+        let err = parse_into_file("0!!!", "origin", &out).expect_err("must fail");
+        assert!(format!("{err}").contains("base64"));
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_brotli_or_bincode() {
+        let tmp = tempfile::Builder::new()
+            .prefix("rust-test")
+            .tempdir()
+            .unwrap();
+        let out = tmp.path().join("git_config");
+        let not_brotli = format!("0{}", URL_SAFE_NO_PAD.encode(b"not-brotli-or-bincode"));
+        let err = parse_into_file(&not_brotli, "origin", &out).expect_err("must fail");
+        assert!(format!("{err}").contains("deserialize"));
     }
 }
