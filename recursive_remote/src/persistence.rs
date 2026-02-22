@@ -39,7 +39,7 @@ pub fn update_state_with_push(
     parent_state_identifier: &Option<StateRef>,
 ) -> Result<State> {
     let mut future = state.clone();
-    future.parents = parent_state_identifier.into_iter().cloned().collect();
+    future.parents = parent_state_identifier.iter().cloned().collect();
 
     let namespace_ref = NamespaceRef(
         encode_namespace(
@@ -241,7 +241,7 @@ pub fn create_commit_tree<'a>(
         .get(namespace_name)
         .context("namespace should have been written already")?;
     let namespace = state
-        .namespace(&namespace_name, encrypt, tracking_repo)?
+        .namespace(namespace_name, encrypt, tracking_repo)?
         .expect("namespace should have been written already");
 
     let name = format!("ns_{}", hex::encode(namespace.random_name));
@@ -262,7 +262,7 @@ pub fn create_commit_tree<'a>(
     };
 
     // This is the "root" state for the current commit.
-    insert_metadata_chunk_tree(&repo, &mut root, "state", &oids).context("insert state.bincode")?;
+    insert_metadata_chunk_tree(repo, &mut root, "state", &oids).context("insert state.bincode")?;
 
     Ok(root.write()?.into())
 }
@@ -279,7 +279,7 @@ fn create_treebuilder_at<'a>(
     .map_err(Into::into)
 }
 
-fn create_chunk_tree_or_blob<'a>(
+fn create_chunk_tree_or_blob(
     repo: &gix::Repository,
     oids: &[ObjectId],
 ) -> Result<Option<(ObjectId, EntryKind)>> {
@@ -309,11 +309,11 @@ fn insert_metadata_chunk_tree<'a>(
     let (oid, mode) = create_chunk_tree_or_blob(repo, oids)?.context("empty metadata")?;
 
     // Don't forget you're here forever.
-    let mut forever_tree = create_treebuilder_at(repo, &root, name)?;
+    let mut forever_tree = create_treebuilder_at(repo, root, name)?;
     let forever_name: [u8; 20] = rand::thread_rng().r#gen();
     insert_into_name_tree(&mut forever_tree, forever_name, oid, mode)?;
     root.upsert(name, EntryKind::Tree, forever_tree.write()?)?;
-    root.upsert(&format!("{name}.bincode"), mode.into(), oid)?;
+    root.upsert(format!("{name}.bincode"), mode, oid)?;
 
     Ok(())
 }
@@ -329,19 +329,18 @@ pub fn create_namespace_tree<'a>(
         _ => unreachable!(),
     };
 
-    insert_metadata_chunk_tree(tracking_repo, &mut root, "namespace", &oids)
+    insert_metadata_chunk_tree(tracking_repo, &mut root, "namespace", oids)
         .context("insert namespace.bincode")?;
 
     if let Some(pack) = namespace.pack.as_ref() {
         match &pack.blob_ref.resource_key {
-            ResourceKey::Git(oids) => match create_chunk_tree_or_blob(tracking_repo, &oids)? {
-                Some((oid, mode)) => {
+            ResourceKey::Git(oids) => {
+                if let Some((oid, mode)) = create_chunk_tree_or_blob(tracking_repo, oids)? {
                     let mut pack_tree = create_treebuilder_at(tracking_repo, &root, "pack")?;
                     insert_into_name_tree(&mut pack_tree, pack.random_name, oid, mode)?;
                     root.upsert("pack", EntryKind::Tree, pack_tree.write()?)?;
                 }
-                _ => {}
-            },
+            }
             ResourceKey::Annex(..) => {
                 unreachable!();
             }

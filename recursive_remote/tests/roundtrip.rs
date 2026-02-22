@@ -199,11 +199,11 @@ impl ScenarioHarness {
         // brittle.
         get_binary(&bin_dir);
 
-        let mut user_repo1 = gix::init(&tmp_path.join("user_repo1")).unwrap();
-        let mut user_repo2 = gix::init(&tmp_path.join("user_repo2")).unwrap();
+        let mut user_repo1 = gix::init(tmp_path.join("user_repo1")).unwrap();
+        let mut user_repo2 = gix::init(tmp_path.join("user_repo2")).unwrap();
         let workdir1 = user_repo1.workdir().unwrap().to_owned();
         let workdir2 = user_repo2.workdir().unwrap().to_owned();
-        let upstream_repo = gix::init_bare(&tmp_path.join("upstream_repo")).unwrap();
+        let upstream_repo = gix::init_bare(tmp_path.join("upstream_repo")).unwrap();
 
         let keys = flavor.gen_keys();
 
@@ -299,7 +299,7 @@ impl ScenarioHarness {
             .current_dir(workdir)
             .arg("commit")
             .arg("-m")
-            .arg(&format!("commit file{}", n))
+            .arg(format!("commit file{}", n))
             .assert()
             .success();
     }
@@ -404,7 +404,7 @@ fn scenario_churn(flavor: &Flavor, embed_config: bool) {
 }
 
 fn read_file(workdir: &Path, name: &str, contents: &str) {
-    let mut fd = std::fs::File::open(workdir.join(&name)).unwrap();
+    let mut fd = std::fs::File::open(workdir.join(name)).unwrap();
     let mut s = String::default();
     fd.read_to_string(&mut s).unwrap();
     assert_eq!(&s, contents);
@@ -417,7 +417,7 @@ fn push_through(remote_name: &str, bin_dir: &Path, source: &Path, dest: &Path) {
         remote_name
     );
     pretty_print(
-        git(&bin_dir)
+        git(bin_dir)
             .current_dir(source)
             .arg("push")
             .arg(remote_name)
@@ -425,7 +425,7 @@ fn push_through(remote_name: &str, bin_dir: &Path, source: &Path, dest: &Path) {
     );
 
     pretty_print(
-        git(&bin_dir)
+        git(bin_dir)
             .current_dir(dest)
             .arg("pull")
             .arg("--rebase=false")
@@ -440,6 +440,6 @@ fn pretty_print(command: &mut std::process::Command) {
 fn get_binary(bin_dir: &Path) {
     let b = assert_cmd::cargo::cargo_bin!("git-remote-recursive");
     std::fs::create_dir(bin_dir).unwrap();
-    std::fs::copy(&b, bin_dir.join("git-remote-recursive"))
+    std::fs::copy(b, bin_dir.join("git-remote-recursive"))
         .expect("copy git-remote-recursive for git helper discovery");
 }

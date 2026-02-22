@@ -96,7 +96,7 @@ impl SplitWriter {
                 self.disk_buf_bytes.try_into().expect("u64"),
                 &mut self.fd,
             )
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "create blob from file"))?;
+            .map_err(|_| std::io::Error::other("create blob from file"))?;
         self.oids.push(oid);
         self.fd.set_len(0)?;
         self.fd.seek(std::io::SeekFrom::Start(0))?;
@@ -251,15 +251,15 @@ pub mod unverified {
     impl BufRead for SplitReader {
         fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
             let buf = &self.buf[self.offset..];
-            if buf.is_empty() {
-                if let Some(oid) = self.oids.pop() {
-                    let mut blob = self
-                        .repo
-                        .find_blob(oid)
-                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "find blob"))?;
-                    self.buf = blob.take_data();
-                    self.offset = 0;
-                }
+            if buf.is_empty()
+                && let Some(oid) = self.oids.pop()
+            {
+                let mut blob = self
+                    .repo
+                    .find_blob(oid)
+                    .map_err(|_| std::io::Error::other("find blob"))?;
+                self.buf = blob.take_data();
+                self.offset = 0;
             }
 
             Ok(&self.buf[self.offset..])
@@ -317,13 +317,13 @@ pub mod unverified {
             }
         };
 
-        if let Some(want_sha256) = want_sha256 {
-            if *want_sha256 != sha256 {
-                anyhow::bail!(format!(
-                    "Expected sha256 {:?}, got {:?}",
-                    want_sha256, sha256
-                ));
-            }
+        if let Some(want_sha256) = want_sha256
+            && *want_sha256 != sha256
+        {
+            anyhow::bail!(format!(
+                "Expected sha256 {:?}, got {:?}",
+                want_sha256, sha256
+            ));
         }
 
         let object_ref = BlobRef {

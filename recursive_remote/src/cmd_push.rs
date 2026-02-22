@@ -35,14 +35,14 @@ fn classify_failed_push_for_retry(
 }
 
 fn parse_push_specs(
-    specs: &Vec<String>,
+    specs: &[String],
     pushes: &mut Vec<(String, String)>,
     force_pushes: &mut Vec<(String, String)>,
 ) -> Result<()> {
     for spec in specs {
         let tok: Vec<_> = spec.split_ascii_whitespace().collect();
         if tok.len() != 2 || tok[0] != "push" {
-            return None.context("not two tokens or not start with push").into();
+            return None.context("not two tokens or not start with push");
         }
         let mut tok = tok[1].split(":");
         let source = tok.next().context("bad push spec source")?.to_string();
@@ -61,7 +61,7 @@ fn start_pack_process(
     namespace: &Namespace,
     pushes: &HashMap<String, Ref>,
     force_pushes: &HashMap<String, Option<Ref>>,
-    shallow_basis: &Vec<Ref>,
+    shallow_basis: &[Ref],
 ) -> Result<std::process::Child> {
     let mut cmd = crate::util::git_command()
         .arg("pack-objects")
@@ -83,7 +83,7 @@ fn start_pack_process(
         .chain(force_pushes.values().filter_map(Option::as_ref))
         .filter_map(|r| r.oid_at_time())
     {
-        write!(&mut stdin, "{}\n", oid).context("write include revs to git pack-objects")?;
+        writeln!(&mut stdin, "{}", oid).context("write include revs to git pack-objects")?;
     }
 
     // EXCLUDE revs that are already in the upstream repository and those in the
@@ -98,11 +98,10 @@ fn start_pack_process(
         // unusual but not impossible, if the user garbage collected some
         // things or whatnot. Arguably git pack-objects could just ignore
         // them, but it does not.
-        if let Ok(result) = user_repo.objects.try_header(oid.as_ref()) {
-            if result.is_some() {
-                write!(&mut stdin, "^{}\n", oid)
-                    .context("write exclude revs to git pack-objects")?;
-            }
+        if let Ok(result) = user_repo.objects.try_header(oid.as_ref())
+            && result.is_some()
+        {
+            writeln!(&mut stdin, "^{}", oid).context("write exclude revs to git pack-objects")?;
         }
     }
 
@@ -111,7 +110,7 @@ fn start_pack_process(
 
 fn convert_force_specs_to_refs(
     user_repo: &gix::Repository,
-    specs: &Vec<(String, String)>,
+    specs: &[(String, String)],
 ) -> Result<HashMap<String, Option<Ref>>> {
     let mut refs = HashMap::new();
     for (target, dest) in specs {
@@ -129,7 +128,7 @@ fn convert_force_specs_to_refs(
 
 fn convert_specs_to_refs(
     user_repo: &gix::Repository,
-    specs: &Vec<(String, String)>,
+    specs: &[(String, String)],
 ) -> Result<HashMap<String, Ref>> {
     let refs = convert_force_specs_to_refs(user_repo, specs).context("parse")?;
     let mut refs_out = HashMap::new();
@@ -187,11 +186,11 @@ fn do_commit(
     }?;
 
     let tree = create_commit_tree(
-        &tracking_repo,
+        tracking_repo,
         namespace_name,
         root,
-        &tracking_repo,
-        &future,
+        tracking_repo,
+        future,
         encrypt,
         max_object_size,
     )
@@ -203,8 +202,8 @@ fn do_commit(
 
 fn attempt_push(
     config: &Config,
-    pushes: &Vec<(String, String)>,
-    force_pushes: &Vec<(String, String)>,
+    pushes: &[(String, String)],
+    force_pushes: &[(String, String)],
 ) -> Result<PushResult> {
     let (state_identifier, state, _basis_state, root_id, _commit_id) =
         update_branches(config).context("push")?;
@@ -311,7 +310,7 @@ fn attempt_push(
             .env("GIT_DIR", &config.tracking_repo_path)
             .arg("push")
             .arg(&config.remote_name)
-            .arg(&format!("{}:{}", &config.pushing_ref, &config.remote_ref))
+            .arg(format!("{}:{}", &config.pushing_ref, &config.remote_ref))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped()),
     )
@@ -330,7 +329,7 @@ fn attempt_push(
     )
 }
 
-pub fn push(config: &Config, specs: &Vec<String>) -> Result<()> {
+pub fn push(config: &Config, specs: &[String]) -> Result<()> {
     let mut pushes = Vec::new();
     let mut force_pushes = Vec::new();
     parse_push_specs(specs, &mut pushes, &mut force_pushes)

@@ -181,11 +181,8 @@ pub struct Config {
 
 impl Args {
     pub fn new(remote_name: &str, remote_url: &str) -> Result<Args> {
-        let user_repo_path = std::fs::canonicalize(
-            std::env::var("GIT_DIR")
-                .context("Git dir not defined.")?
-                .to_string(),
-        )?;
+        let user_repo_path =
+            std::fs::canonicalize(std::env::var("GIT_DIR").context("Git dir not defined.")?)?;
 
         let state_path = user_repo_path.join("recursive_remote");
         let tracking_repo_path = state_path.join("tracking_repo");
@@ -278,7 +275,7 @@ impl Config {
         }
 
         let subsection: &BStr = args.remote_name.as_bytes().into();
-        tracking_config.remove_section("remote", Some(subsection.into()));
+        tracking_config.remove_section("remote", Some(subsection));
         configure_tracking_config(&args, &user_config, &mut tracking_config)
             .context("configure tracking config")?;
 
@@ -353,7 +350,7 @@ impl Config {
 }
 
 fn configure_namespace(args: &Args, git_config: &gix_config::File) -> Result<String> {
-    match read_config(args, ConfigKey::Namespace, &git_config)? {
+    match read_config(args, ConfigKey::Namespace, git_config)? {
         Some(namespace) => Ok(namespace.to_string()),
         None => Ok(String::default()),
     }
@@ -389,17 +386,17 @@ fn configure_nacl_key_file(value: &str) -> Result<Option<eseb::SymmetricKey>> {
     let key = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&value)
+        .open(value)
     {
         Ok(mut fd) => {
             info!("Storing newly created NaCl key in file {:?}.", &value);
             let key = eseb::SymmetricKey::gen_key().context("gen key file")?;
-            fd.write_all(&key.serialize_to_string().as_bytes())?;
+            fd.write_all(key.serialize_to_string().as_bytes())?;
             key
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             trace!("Reading key file: {:?}", &value);
-            let mut fd = std::fs::File::open(&value)?;
+            let mut fd = std::fs::File::open(value)?;
             let mut s = String::default();
             fd.read_to_string(&mut s).context("Failed to read key.")?;
             eseb::SymmetricKey::from_str(s.trim()).context("decode key")?
@@ -407,7 +404,7 @@ fn configure_nacl_key_file(value: &str) -> Result<Option<eseb::SymmetricKey>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && value.starts_with("~/") => {
             let home = std::env::var("HOME").context("read env var HOME")?;
             let value = PathBuf::from(home).join(&value[2..]);
-            return configure_nacl_key_file(&*value.to_string_lossy());
+            return configure_nacl_key_file(&value.to_string_lossy());
         }
         Err(e) => return Err(e.into()),
     };
@@ -420,7 +417,7 @@ pub fn configure_nacl(
     args: &Args,
     git_config: &mut gix_config::File<'static>,
 ) -> Result<Option<eseb::SymmetricKey>> {
-    match read_config(args, c_key, &git_config)? {
+    match read_config(args, c_key, git_config)? {
         None => Ok(None),
         Some(value) if value.starts_with("file://".as_bytes()) => {
             configure_nacl_key_file(value[7..].to_string().as_str())
@@ -431,7 +428,7 @@ pub fn configure_nacl(
 
 pub fn configure_remote_branch(args: &Args, git_config: &gix_config::File) -> Result<String> {
     Ok(
-        match read_config(&args, ConfigKey::RemoteBranch, &git_config)? {
+        match read_config(args, ConfigKey::RemoteBranch, git_config)? {
             Some(branch) => {
                 if branch.starts_with(b"refs/heads/") {
                     branch.to_string()
@@ -450,13 +447,13 @@ pub fn configure_shallow_basis(
     git_config: &gix_config::File,
 ) -> Result<Vec<Ref>> {
     let mut refs = Vec::default();
-    for spec in read_config(&args, ConfigKey::ShallowBasis, &git_config)?
+    for spec in read_config(args, ConfigKey::ShallowBasis, git_config)?
         .unwrap_or_default()
         .to_string()
         .split_whitespace()
     {
         refs.push(
-            Ref::new(user_repo, &spec)
+            Ref::new(user_repo, spec)
                 .with_context(|| format!("resolve shallow basis ref {}", &spec))?,
         );
     }
@@ -469,7 +466,7 @@ pub fn read_config<'a>(
     git_config: &'a gix_config::File,
 ) -> Result<Option<Cow<'a, BStr>>> {
     let subsection: &BStr = args.remote_name.as_bytes().into();
-    Ok(git_config.string_by("remote", Some(subsection.into()), key))
+    Ok(git_config.string_by("remote", Some(subsection), key))
 }
 
 pub fn read_config_i64(
@@ -479,7 +476,7 @@ pub fn read_config_i64(
 ) -> Result<Option<i64>> {
     let subsection: &BStr = args.remote_name.as_bytes().into();
     git_config
-        .integer_by("remote", Some(subsection.into()), key)
+        .integer_by("remote", Some(subsection), key)
         .transpose()
         .map_err(Into::into)
 }
@@ -491,7 +488,7 @@ pub fn write_config(
     value: &str,
 ) -> Result<()> {
     let subsection: &BStr = remote_name.as_bytes().into();
-    git_config.set_raw_value_by("remote", Some(subsection.into()), key, value)?;
+    git_config.set_raw_value_by("remote", Some(subsection), key, value)?;
     Ok(())
 }
 
@@ -503,12 +500,7 @@ pub fn write_config_i64(
 ) -> Result<()> {
     let subsection: &BStr = remote_name.as_bytes().into();
     git_config
-        .set_raw_value_by(
-            "remote",
-            Some(subsection.into()),
-            key,
-            value.to_string().as_str(),
-        )
+        .set_raw_value_by("remote", Some(subsection), key, value.to_string().as_str())
         .context(key)?;
     Ok(())
 }
@@ -520,12 +512,7 @@ pub fn configure_tracking_config(
 ) -> Result<()> {
     let subsection: &BStr = args.remote_name.as_bytes().into();
     tracking_config
-        .set_raw_value_by(
-            "remote",
-            Some(subsection.into()),
-            "url",
-            args.remote_url.as_str(),
-        )
+        .set_raw_value_by("remote", Some(subsection), "url", args.remote_url.as_str())
         .context("set remote url")?;
 
     const PREFIX: &str = "recursion-inner-";
@@ -533,18 +520,18 @@ pub fn configure_tracking_config(
         for section in sections {
             if Some(subsection) == section.header().subsection_name() {
                 for value_name in section.value_names() {
-                    if value_name.starts_with(PREFIX.as_bytes()) {
-                        if let Some(value) = section.value(value_name) {
-                            let inner_name = value_name[PREFIX.len() - 1..].to_string();
-                            tracking_config
-                                .set_raw_value_by(
-                                    "remote",
-                                    Some(subsection.into()),
-                                    inner_name,
-                                    &*value,
-                                )
-                                .context("set tracking config")?;
-                        }
+                    if value_name.starts_with(PREFIX.as_bytes())
+                        && let Some(value) = section.value(value_name)
+                    {
+                        let inner_name = value_name[PREFIX.len() - 1..].to_string();
+                        tracking_config
+                            .set_raw_value_by(
+                                "remote",
+                                Some(subsection),
+                                inner_name,
+                                value.as_ref(),
+                            )
+                            .context("set tracking config")?;
                     }
                 }
             }

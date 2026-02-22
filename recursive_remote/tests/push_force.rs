@@ -143,7 +143,7 @@ fn configure_remote(repo: &mut gix::Repository, remote_name: &str, url: &str) {
 fn get_binary(bin_dir: &Path) {
     let b = assert_cmd::cargo::cargo_bin!("git-remote-recursive");
     std::fs::create_dir(bin_dir).expect("create bin dir");
-    std::fs::copy(&b, bin_dir.join("git-remote-recursive"))
+    std::fs::copy(b, bin_dir.join("git-remote-recursive"))
         .expect("copy git-remote-recursive for git helper discovery");
 }
 

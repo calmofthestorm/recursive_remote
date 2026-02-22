@@ -84,7 +84,7 @@ pub fn anyhow_ref_commit(
     let sig = rr_signature();
     let mut committer_time = gix_date::parse::TimeBuf::default();
     let mut author_time = gix_date::parse::TimeBuf::default();
-    let x = match repo
+    match repo
         .try_find_reference(ref_name)
         .with_context(|| format!("failed to lookup refname {} to oid", &ref_name))?
     {
@@ -114,8 +114,7 @@ pub fn anyhow_ref_commit(
         }
     }
     .with_context(|| format!("failed to commit tree {} to ref {}", &tree, &ref_name))
-    .map(Into::into);
-    x
+    .map(Into::into)
 }
 
 pub fn peel_reference_to_commit<'a>(
@@ -137,9 +136,9 @@ pub fn peel_reference_to_commit<'a>(
 }
 
 pub fn open_create_bare_repository(path: &Path) -> anyhow::Result<gix::Repository> {
-    match gix::open(&path) {
+    match gix::open(path) {
         Ok(r) => Ok(r),
-        Err(_) => gix::init_bare(&path)
+        Err(_) => gix::init_bare(path)
             .with_context(|| format!("failed to init bare repository in {}", path.display())),
     }
 }

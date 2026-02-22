@@ -48,12 +48,12 @@ pub fn embed_remote(config: &gix_config::File, remote: &str) -> Result<(String, 
     for key in ConfigKey::iter() {
         if let Some(v) = if key.is_i64() {
             config
-                .integer_by("remote", Some(subsection.into()), key)
+                .integer_by("remote", Some(subsection), key)
                 .transpose()?
                 .map(ConfigValue::Int64)
         } else {
             config
-                .string_by("remote", Some(subsection.into()), key)
+                .string_by("remote", Some(subsection), key)
                 .map(|v| ConfigValue::String(Cow::Owned(v.to_string())))
         } {
             map.insert(key.as_short_str().to_string(), v);
@@ -61,7 +61,7 @@ pub fn embed_remote(config: &gix_config::File, remote: &str) -> Result<(String, 
     }
 
     let url = config
-        .string_by("remote", Some(subsection.into()), "url")
+        .string_by("remote", Some(subsection), "url")
         .map(|s| s.to_string());
     let map = EmbeddedConfig(map);
 
@@ -133,7 +133,7 @@ pub fn parse_into_file(embedded: &str, remote_name: &str, out: &Path) -> Result<
         }
     }
 
-    config.write_to(&mut std::fs::File::create(&out)?)?;
+    config.write_to(&mut std::fs::File::create(out)?)?;
 
     Ok(())
 }
@@ -145,7 +145,7 @@ mod tests {
 
     use super::*;
 
-    const TEXT: &'static str = r#"
+    const TEXT: &str = r#"
 [remote "qux"]
     recursive-namespace = foo
     recursive-remote-branch = "bar-baz"
@@ -167,17 +167,17 @@ mod tests {
         let config_path = tmp.join("git_config");
         let parsed_config_path = tmp.join("parsed_git_config");
 
-        std::fs::write(&config_path, &TEXT).unwrap();
+        std::fs::write(&config_path, TEXT).unwrap();
 
         let embedded = embed_file(&config_path).unwrap();
         assert_eq!(embedded.len(), 1);
         let (embedded, _url) = embedded.get("qux").unwrap();
-        let parsed = parse(&embedded, remote_name).unwrap();
+        let parsed = parse(embedded, remote_name).unwrap();
         std::fs::write(&parsed_config_path, &parsed).unwrap();
 
         let config = gix_config::File::from_paths_metadata(
             Some(gix_config::file::Metadata {
-                path: Some(parsed_config_path.into()),
+                path: Some(parsed_config_path),
                 source: Source::Api,
                 level: 0,
                 trust: Trust::Full,
@@ -222,7 +222,7 @@ mod tests {
 
         {
             let mut config = gix_config::File::new(gix_config::file::Metadata {
-                path: Some(config1_path.clone().into()),
+                path: Some(config1_path.clone()),
                 source: Source::Api,
                 level: 0,
                 trust: Trust::Full,
@@ -238,7 +238,7 @@ mod tests {
 
         {
             let mut config = gix_config::File::new(gix_config::file::Metadata {
-                path: Some(config2_path.clone().into()),
+                path: Some(config2_path.clone()),
                 source: Source::Api,
                 level: 0,
                 trust: Trust::Full,

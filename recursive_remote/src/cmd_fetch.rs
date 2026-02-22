@@ -27,14 +27,14 @@ use crate::util::*;
 // is to fetch multiple thin packs, fix them (which requires deltas from each
 // other and the base repo cloned), then repack them all into one big pack,
 // since that's how the special remote protocol prefers to handle locking.
-pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
+pub fn fetch(config: &Config, revs: &[String]) -> Result<()> {
     let (state_identifier, state, basis_ref, _root_id, commit_id) =
         update_branches(config).context("fetch")?;
 
     let tracking_repo = Rc::new(config.tracking_repo()?);
 
     let ordered_packs = materialize_ordered_pack_list(
-        &config,
+        config,
         &tracking_repo,
         state_identifier.as_ref(),
         &state,
@@ -105,7 +105,7 @@ pub fn fetch(config: &Config, revs: &Vec<String>) -> Result<()> {
     // Ensure that all objects ever downloaded remain reachable.
     compact_ref_reachability(&all_objects_ever_repo, &config.remote_name)?;
 
-    println!("");
+    println!();
 
     Ok(())
 }
@@ -117,14 +117,14 @@ pub fn materialize_ordered_pack_list(
     state: &State,
     basis_ref: Option<&StateRef>,
 ) -> Result<Vec<PackRef>> {
-    let mut stack = vec![(state_identifier.map(Clone::clone), Some(state))];
+    let mut stack = vec![(state_identifier.cloned(), Some(state))];
 
     let mut ordered_packs = Vec::default();
     while let Some((state_identifier, state)) = stack.pop() {
-        if let (Some(basis_ref), Some(state_identifier)) = (basis_ref, state_identifier.as_ref()) {
-            if basis_ref == state_identifier {
-                continue;
-            }
+        if let (Some(basis_ref), Some(state_identifier)) = (basis_ref, state_identifier.as_ref())
+            && basis_ref == state_identifier
+        {
+            continue;
         }
 
         let mut _sh = None;
@@ -146,7 +146,7 @@ pub fn materialize_ordered_pack_list(
         };
 
         let namespace = state
-            .namespace(&config.namespace, &config.nacl_keys, &tracking_repo)?
+            .namespace(&config.namespace, &config.nacl_keys, tracking_repo)?
             .context("traverse")?;
 
         ordered_packs.extend(namespace.pack);
@@ -247,7 +247,7 @@ pub fn fetch_pack(
     let stdout = cmd.stdout.take().context("No stdout.")?;
 
     let (_blob_ref, size) = decode(
-        &tracking_repo,
+        tracking_repo,
         &pack_ref.blob_ref,
         stdin,
         config.nacl_keys.namespace_key(),
@@ -271,13 +271,13 @@ pub fn fetch_pack(
         }
     }
 
-    for line in std::io::BufReader::new(stdout).lines() {
+    if let Some(line) = std::io::BufReader::new(stdout).lines().next() {
         let line = line?;
         let tok: Vec<_> = line.split_ascii_whitespace().collect();
         if tok.len() != 2 {
             anyhow::bail!("expected a line like 'keep <packname>'");
         }
-        let name = hex::decode(&tok[1]).context("decode hex written pack name")?;
+        let name = hex::decode(tok[1]).context("decode hex written pack name")?;
         return Ok(Some(name.try_into().expect("")));
     }
 

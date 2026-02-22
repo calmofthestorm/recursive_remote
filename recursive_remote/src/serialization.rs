@@ -122,6 +122,12 @@ impl Namespace {
     }
 }
 
+impl Default for Namespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for StateRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -150,7 +156,7 @@ impl std::fmt::Display for ResourceKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResourceKey::Annex(key) => write!(f, "annex:{}", &key),
-            ResourceKey::Git(oids) if oids.len() == 0 => f.write_str("git:()"),
+            ResourceKey::Git(oids) if oids.is_empty() => f.write_str("git:()"),
             ResourceKey::Git(oids) if oids.len() == 1 => write!(f, "git:{}", &oids[0]),
             ResourceKey::Git(oids) => {
                 write!(f, "git:({}", &oids[0])?;
@@ -417,7 +423,7 @@ impl State {
     ) -> Result<Option<Namespace>> {
         match self.namespaces.get(namespace) {
             Some(namespace_ref) => Ok(Some(
-                crate::encoding::decode_namespace(tracking_repo, &namespace_ref, keys)
+                crate::encoding::decode_namespace(tracking_repo, namespace_ref, keys)
                     .with_context(|| format!("load namespace {}", namespace))?,
             )),
             None => Ok(None),

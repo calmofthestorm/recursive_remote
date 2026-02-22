@@ -18,6 +18,16 @@ pub enum RatchetError {
     RatchetError,
 }
 
+type BranchState = (
+    Option<StateRef>,
+    State,
+    Option<StateRef>,
+    Option<ObjectId>,
+    Option<ObjectId>,
+);
+
+type ResolvedState = (ObjectId, (StateRef, State), ObjectId);
+
 // Force fetches the remote ref into `pushing_ref`, then validates that it is a
 // fast-forward from the current `tracking_ref` using the sha256 inner hash
 // structure. If not, this is an error. Otherwise, fetches into `tracking_ref`.`
@@ -25,15 +35,7 @@ pub enum RatchetError {
 // We use the inner structure rather than git history to enforce continuous
 // logical history while allowing for rewriting git history to remove temporary
 // artifacts.
-pub fn update_branches(
-    config: &Config,
-) -> Result<(
-    Option<StateRef>,
-    State,
-    Option<StateRef>,
-    Option<ObjectId>,
-    Option<ObjectId>,
-)> {
+pub fn update_branches(config: &Config) -> Result<BranchState> {
     log::trace!("Fetching pushing branch from underlying remote.");
     update_pushing_branch(config).context("pushing tracking branch")?;
 
@@ -83,7 +85,7 @@ fn update_pushing_branch(config: &Config) -> Result<()> {
                     .stderr(std::process::Stdio::piped())
                     .arg("fetch")
                     .arg(&config.remote_name)
-                    .arg(&format!("+{}:{}", &config.remote_ref, &config.pushing_ref)),
+                    .arg(format!("+{}:{}", &config.remote_ref, &config.pushing_ref)),
             )
             .ok()
             .context("Failed to fetch underlying branch.")?;
@@ -98,12 +100,12 @@ pub fn resolve_state_ref(
     tracking_repo: &Rc<gix::Repository>,
     keys: &EncryptionKeys,
     name: &str,
-) -> Result<Option<(ObjectId, (StateRef, State), ObjectId)>> {
-    Ok(match ref_to_state_oid(&tracking_repo, name)? {
+) -> Result<Option<ResolvedState>> {
+    Ok(match ref_to_state_oid(tracking_repo, name)? {
         Some((commit_oid, root_oid, tree_oid)) => Some((
             commit_oid,
             crate::encoding::unverified::decode_unverified_state_from_tree_or_blob_oid(
-                &tracking_repo,
+                tracking_repo,
                 tree_oid,
                 keys,
                 /*want_sha256=*/ &None,
@@ -114,15 +116,7 @@ pub fn resolve_state_ref(
     })
 }
 
-fn update_tracking_branch(
-    config: &Config,
-) -> Result<(
-    Option<StateRef>,
-    State,
-    Option<StateRef>,
-    Option<ObjectId>,
-    Option<ObjectId>,
-)> {
+fn update_tracking_branch(config: &Config) -> Result<BranchState> {
     let tracking_repo = Rc::new(config.tracking_repo()?);
 
     let resolve = |name| resolve_state_ref(&tracking_repo, &config.nacl_keys, name);
@@ -132,10 +126,10 @@ fn update_tracking_branch(
     let bas_oid = resolve(&config.basis_ref).context("get state oid for basis ref")?;
     let bas_oid = bas_oid.map(|bas| bas.1.0);
 
-    if let (Some(cur), Some(fut)) = (cur_oid.as_ref(), fut_oid.as_ref()) {
-        if !valid_path_exists(config, &tracking_repo, &(cur.1).0, &(fut.1).0)? {
-            return Err(RatchetError::RatchetError.into());
-        }
+    if let (Some(cur), Some(fut)) = (cur_oid.as_ref(), fut_oid.as_ref())
+        && !valid_path_exists(config, &tracking_repo, &(cur.1).0, &(fut.1).0)?
+    {
+        return Err(RatchetError::RatchetError.into());
     }
 
     match fut_oid {
@@ -191,7 +185,7 @@ fn valid_path_exists(
     // This is permissive, since we only care about valid paths.
     while let Some(traverse) = stack.pop() {
         match encoding::decode_state(tracking_repo, &traverse, &config.nacl_keys) {
-            Ok(state) if state.parents.contains(&current) => return Ok(true),
+            Ok(state) if state.parents.contains(current) => return Ok(true),
             Ok(mut state) => {
                 stack.append(&mut state.parents);
             }

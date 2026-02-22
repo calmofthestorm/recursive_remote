@@ -81,7 +81,7 @@ fn handle_list(config: &Config) -> Result<()> {
         trace!("\t{} -> {}", &name, &target.to_git_wire_string());
         println!("{} {}", &target.to_git_wire_string(), &name);
     }
-    println!("");
+    println!();
     Ok(())
 }
 
@@ -133,11 +133,11 @@ fn cleanup_keep_files(pack_dir: &std::path::Path) -> Result<()> {
     {
         let fp = fp.context("read dirent")?;
         let fp = fp.path();
-        if let Some(ext) = fp.extension() {
-            if ext == "keep" {
-                std::fs::remove_file(&fp)
-                    .with_context(|| format!("remove keep file {}", fp.display()))?;
-            }
+        if let Some(ext) = fp.extension()
+            && ext == "keep"
+        {
+            std::fs::remove_file(&fp)
+                .with_context(|| format!("remove keep file {}", fp.display()))?;
         }
     }
     Ok(())
@@ -249,11 +249,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("embed git config file {}", &path))?;
         for (embedded, url) in entries.into_values() {
             let url = url.unwrap_or_default();
-            let url = if url.starts_with("recursive::") {
-                &url[11..]
-            } else {
-                &url[..]
-            };
+            let url = url.strip_prefix("recursive::").unwrap_or(&url);
             println!("recursive::{}:{}", &embedded, &url);
         }
         Ok(())
@@ -355,7 +351,7 @@ fn do_debug_dump(config: &Config) -> Result<()> {
     for name in state.namespaces.keys() {
         eprintln!("History for Namespace {}", name);
         let ordered_packs = recursive_remote::cmd_fetch::materialize_ordered_pack_list(
-            &config,
+            config,
             &tracking_repo,
             Some(&state_identifier),
             &state,
@@ -475,7 +471,7 @@ fn git_special_remote_main(remote_name: &str, remote_spec: &str, debug_dump: boo
         let lock = recursive_remote::util::acquire_flock(
             &config
                 .lock_path
-                .join(&format!("recursive_remote.{}.lock", &config.remote_name)),
+                .join(format!("recursive_remote.{}.lock", &config.remote_name)),
         );
 
         // My initial intent was to have per-remote locking. I've decided to
