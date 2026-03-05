@@ -7,7 +7,7 @@ use clap::App;
 use log::{error, info, trace};
 
 use recursive_remote::config::*;
-use recursive_remote::serialization::Namespace;
+use recursive_remote::serialization::{Namespace, Ref};
 use recursive_remote::update::*;
 use recursive_remote::util::*;
 
@@ -77,12 +77,43 @@ fn handle_list(config: &Config) -> Result<()> {
             &Rc::new(config.tracking_repo()?),
         )?
         .unwrap_or_else(Namespace::new);
+    let mut advertised = std::collections::BTreeMap::new();
     for (name, target) in namespace.refs.iter() {
-        trace!("\t{} -> {}", &name, &target.to_git_wire_string());
-        println!("{} {}", &target.to_git_wire_string(), &name);
+        let advertised_name = to_advertised_ref_name(name, &config.remote_name);
+        let advertised_target = to_advertised_target(target, &config.remote_name);
+        trace!(
+            "\t{} -> {} (advertise as {})",
+            &name, &advertised_target, &advertised_name
+        );
+        advertised.insert(advertised_name, advertised_target);
+    }
+    for (name, target) in advertised {
+        println!("{target} {name}");
     }
     println!();
     Ok(())
+}
+
+fn to_advertised_ref_name(name: &str, remote_name: &str) -> String {
+    match remotes_to_heads_ref(name, remote_name) {
+        Some(short) => format!("refs/heads/{short}"),
+        None => name.to_string(),
+    }
+}
+
+fn to_advertised_target(target: &Ref, remote_name: &str) -> String {
+    match target {
+        Ref::Direct(oid) => oid.to_string(),
+        Ref::Symbolic(symbolic, _) => match remotes_to_heads_ref(symbolic, remote_name) {
+            Some(short) => format!("refs/heads/{short}"),
+            None => symbolic.to_string(),
+        },
+    }
+}
+
+fn remotes_to_heads_ref<'a>(name: &'a str, remote_name: &str) -> Option<&'a str> {
+    let prefix = format!("refs/remotes/{remote_name}/");
+    name.strip_prefix(&prefix)
 }
 
 fn handle_push<I>(config: &Config, lines: &mut I, line: String) -> Result<()>
@@ -586,6 +617,39 @@ mod tests {
             ProtocolCommand::Ignore
         );
         assert_eq!(parse_protocol_command(""), ProtocolCommand::Ignore);
+    }
+
+    #[test]
+    fn to_advertised_ref_name_maps_remote_tracking_refs() {
+        assert_eq!(
+            to_advertised_ref_name("refs/remotes/origin/main", "origin"),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            to_advertised_ref_name("refs/heads/main", "origin"),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            to_advertised_ref_name("refs/remotes/upstream/main", "origin"),
+            "refs/remotes/upstream/main"
+        );
+    }
+
+    #[test]
+    fn to_advertised_target_maps_symbolic_remote_tracking_refs() {
+        let oid =
+            gix_hash::ObjectId::from_hex(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("oid");
+        assert_eq!(
+            to_advertised_target(
+                &Ref::Symbolic("refs/remotes/origin/main".to_string(), None),
+                "origin"
+            ),
+            "refs/heads/main"
+        );
+        assert_eq!(
+            to_advertised_target(&Ref::Direct(oid), "origin"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     fn tmp_args() -> Args {
