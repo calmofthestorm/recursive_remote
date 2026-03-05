@@ -204,9 +204,8 @@ fn parse_fetch_revs(revs: &[String]) -> HashSet<String> {
         let Some(oidish) = tok.next() else {
             continue;
         };
-        let end = std::cmp::min(40, oidish.len());
-        if end > 0 {
-            fetch_revs.insert(oidish[..end].to_string());
+        if !oidish.is_empty() {
+            fetch_revs.insert(oidish.to_string());
         }
     }
     fetch_revs
@@ -319,12 +318,16 @@ mod tests {
             "capabilities".to_string(),
             "fetch abcdef".to_string(),
             "fetch 0123456789012345678901234567890123456789 refs/heads/main".to_string(),
+            "fetch 012345678901234567890123456789012345678901234567890123456789abcd refs/heads/main".to_string(),
             "fetch".to_string(),
         ];
         let parsed = parse_fetch_revs(&revs);
         assert!(parsed.contains("abcdef"));
         assert!(parsed.contains("0123456789012345678901234567890123456789"));
-        assert_eq!(parsed.len(), 2);
+        assert!(
+            parsed.contains("012345678901234567890123456789012345678901234567890123456789abcd")
+        );
+        assert_eq!(parsed.len(), 3);
     }
 
     #[test]
